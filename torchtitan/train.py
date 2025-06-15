@@ -474,9 +474,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ft.maybe_semi_sync_training(
                 job_config,
                 ft_manager=self.ft_manager,
-                model=self.model_parts[0],
+                model_fragments=self.model_parts,
                 optimizer=self.optimizers,
                 sync_every=job_config.fault_tolerance.sync_steps,
+                should_quantize=job_config.fault_tolerance.should_quantize,
+                fragment_sync_delay=job_config.fault_tolerance.fragment_sync_delay,
+                fragment_update_alpha=job_config.fault_tolerance.fragment_update_alpha,
             ),
         ):
             data_iterator = self.batch_generator(self.dataloader)
