@@ -7,7 +7,6 @@
 import copy
 import importlib
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import ContextManager, Optional, TYPE_CHECKING, Union
 
 import torch
@@ -18,7 +17,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.distributed_c10d import ReduceOp
 from torch.distributed.tensor import DTensor
 from torchtitan.config_manager import JobConfig
-from torchtitan.distributed import ParallelDims
 
 if importlib.util.find_spec("torchft") is not None:
     import torchft as ft
@@ -106,41 +104,6 @@ def init_ft_manager(job: JobConfig) -> FTManager:
     )
 
 
-@dataclass
-class FTParallelDims(ParallelDims):
-    ft_manager: FTManager
-
-    def build_mesh(self, device_type: str) -> DeviceMesh:
-        def func(
-            device_type: str, mesh_shape: list[int], mesh_dim_names: list[str]
-        ) -> DeviceMesh:
-            from torchft.process_group import ft_init_device_mesh
-
-            return ft_init_device_mesh(
-                device_type=device_type,
-                mesh_shape=mesh_shape,
-                mesh_dim_names=mesh_dim_names,
-                replicate_dim=mesh_dim_names.index("dp_replicate"),
-                manager=self.ft_manager.manager,
-            )
-
-        dims = []
-        names = []
-        for d, name in zip(
-            [self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp],
-            ["pp", "dp_replicate", "dp_shard", "cp", "tp"],
-        ):
-            if d > 1 or name == "dp_replicate":
-                dims.append(d)
-                names.append(name)
-
-        return self._build_mesh(device_type, dims, names, func)
-
-    @property
-    def dp_replicate_enabled(self):
-        return True
-
-
 def ft_dist_reduce(
     x: torch.Tensor, reduceOp: str, mesh: DeviceMesh
 ) -> tuple[torch.Tensor, str, DeviceMesh]:
@@ -189,15 +152,19 @@ def maybe_semi_sync_training(
             # Create the outer optimizer based on the inner optimizer parameters.
             params = [group["params"] for group in optimizer.param_groups]
             params = [param for sublist in params for param in sublist]
-            outer_optimizer = torch.optim.SGD(
-                params, lr=0.7, momentum=0.9, nesterov=True
-            )
+            outer_optimizers = []
+            for model in model_parts:
+                params = [p for p in model.parameters() if p.requires_grad]
+                outer_optimizer = torch.optim.SGD(
+                    params, lr=0.7, momentum=0.9, nesterov=True
+                )
+                outer_optimizers.append(outer_optimizer)
 
             return local_sgd.DiLoCo(
                 manager=ft_manager._manager,
                 model_fragments=model_parts,
                 inner_optimizer=optimizer,
-                outer_optimizer=outer_optimizer,
+                outer_optimizer=outer_optimizers,
                 sync_every=ft_config.sync_steps,
                 should_quantize=ft_config.should_quantize,
                 fragment_sync_delay=ft_config.fragment_sync_delay,
