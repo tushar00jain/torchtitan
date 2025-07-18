@@ -37,7 +37,12 @@ class FTManager:
         if not has_torchft:
             raise ImportError("torchft is not installed. Please install it.")
 
-        pg = ft.ProcessGroupNCCL()
+        if ft_config.process_group == "gloo":
+            pg = ft.ProcessGroupGloo()
+        elif ft_config.process_group == "nccl":
+            pg = ft.ProcessGroupNCCL()
+        else:
+            raise ValueError(f"Unsuported process group: {ft_config.process_group}")
 
         # If the training method is specific, then the quorum should be synchronous
         self.use_async_quorum = ft_config.semi_sync_method is None
