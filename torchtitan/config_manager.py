@@ -606,6 +606,11 @@ class FaultTolerance:
     Note that this is still an experimental feature.
     """
 
+    process_group: str = "gloo"
+    """
+    The process group to use for fault tolerance. Currently, only "gloo" and "nccl" are supported
+    """
+
     replica_id: int = 0
     """The TorchFT replica ID of this run."""
 
