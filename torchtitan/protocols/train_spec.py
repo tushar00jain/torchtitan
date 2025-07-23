@@ -73,6 +73,9 @@ ParallelizeFunction: TypeAlias = Callable[..., nn.Module]
 PipeliningFunction: TypeAlias = Callable[
     ..., tuple[_PipelineSchedule, list[nn.Module], bool, bool]
 ]
+FTFragmentFunction: TypeAlias = Callable[
+    ..., list[nn.Module]
+]
 DataLoaderBuilder: TypeAlias = Callable[..., BaseDataLoader]
 TokenizerBuilder: TypeAlias = Callable[..., BaseTokenizer]
 MetricsProcessorBuilder: TypeAlias = Callable[..., MetricsProcessor]
@@ -99,6 +102,7 @@ class TrainSpec:
     build_dataloader_fn: DataLoaderBuilder
     build_tokenizer_fn: TokenizerBuilder | None
     build_loss_fn: LossFunctionBuilder
+    ft_fragment_fn: FTFragmentFunction | None = None
     build_validator_fn: ValidatorBuilder | None = None
     build_metrics_processor_fn: MetricsProcessorBuilder | None = None
     state_dict_adapter: type[StateDictAdapter] | None = None

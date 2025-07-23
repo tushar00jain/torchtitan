@@ -14,6 +14,7 @@ from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
 from .infra.parallelize import parallelize_llama
 from .infra.pipeline import pipeline_llama
+from .infra.fault_tolerance import fragment_llama
 from .model.args import TransformerModelArgs
 from .model.model import Transformer
 from .model.state_dict_adapter import Llama3StateDictAdapter
@@ -76,6 +77,7 @@ register_train_spec(
         model_args=llama3_configs,
         parallelize_fn=parallelize_llama,
         pipelining_fn=pipeline_llama,
+        ft_fragment_fn=fragment_llama,
         build_optimizers_fn=build_optimizers,
         build_lr_schedulers_fn=build_lr_schedulers,
         build_dataloader_fn=build_hf_dataloader,

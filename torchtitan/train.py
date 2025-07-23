@@ -42,6 +42,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     # swappable training components in TrainSpec
     dataloader: train_spec_module.BaseDataLoader
     model_parts: list[torch.nn.Module]
+    ft_model_parts: list[torch.nn.Module]
     loss_fn: train_spec_module.LossFunction
     optimizers: train_spec_module.OptimizersContainer
     lr_schedulers: train_spec_module.LRSchedulersContainer
@@ -255,6 +256,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             model.train()
 
             self.model_parts = [model]
+
+            ft = job_config.fault_tolerance
+
+            if ft.enable:
+                if self.train_spec.ft_fragment_fn:
+                    self.ft_model_parts = self.train_spec.ft_fragment_fn(model, job_config, model_args)
+                else:
+                    self.ft_model_parts = [model]
+
 
         self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
 
@@ -501,7 +511,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             maybe_semi_sync_training(
                 job_config.fault_tolerance,
                 ft_manager=self.ft_manager,
-                model_parts=self.model_parts,
+                model_parts=self.ft_model_parts,
                 optimizer=self.optimizers,
             ),
         ):
