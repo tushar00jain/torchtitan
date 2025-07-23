@@ -312,6 +312,7 @@ class Parallelism:
 
     pipeline_parallel_split_points: list[str] = field(default_factory=list)
     """
+    DEPRECATED: Use module_names_per_model_chunk instead.
     Specify comma-separated names of modules to use as the beginning of a split point.
     e.g. "layers.0,layers.2" will cause the model to be split into 3 stages,
     the first containing all the layers up to layers.0,
@@ -319,6 +320,16 @@ class Parallelism:
     the third containing layers.2 and all the remaining layers.
     Note: fully-automated splitting may be enabled in the future,
     but currently the split points must be specified manually.
+    """
+
+    module_names_per_model_chunk: list[list[str]] = field(default_factory=list)
+    """
+    Specify a list of lists containing the FQNs (Fully Qualified Names) of modules for each model chunk.
+    Each inner list represents one model chunk and contains the module names that belong to that chunk.
+    e.g. [['tok_embeddings', 'layers.0'], ['layers.1', 'layers.2'], ['layers.3', 'layers.4']]
+    will create 3 chunks: the first containing tok_embeddings and layers.0,
+    the second containing layers.1 and layers.2, and the third containing layers.3 and layers.4.
+    This provides more explicit control over which modules belong to each chunk compared to split points.
     """
 
     pipeline_parallel_layers_per_stage: int | None = None
@@ -399,31 +410,31 @@ class Checkpoint:
     "//pre_train/checkpoints/llama3/llama3_8b/step_10000".
     """
 
-    initial_load_model_weights_only: bool = True
+    initial_load_model_only: bool = True
     """
-    This option specifies if only the model weights should be loaded during the initial
+    This option specifies if only the model should be loaded during the initial
     checkpoint load. The option is only used when `initial_load_path` is specified.
     If False, the checkpoint at `initial_load_path` is treated as a standard training
     checkpoint, including optimizer and training states.
     The default setting for this option is True. Note that you will have to use
-    `--checkpoint.no_initial_load_model_weights_only` to override the default setting.
+    `--checkpoint.no_initial_load_model_only` to override the default setting.
     """
 
     interval: int = 500
     """Checkpointing interval in steps."""
 
-    last_save_model_weights_only: bool = True
+    last_save_model_only: bool = True
     """
-    When last_save_model_weights_only=True, only model weights will be saved at the end of training,
+    When last_save_model_only=True, only the model will be saved at the end of training,
     the last save.  With this, checkpoints can be loaded using `torch.load(..., weights_only=True)`
-    after conversion.  When last_save_model_weights_only=False, the full checkpoint will be saved.
+    after conversion.  When last_save_model_only=False, the full checkpoint will be saved.
     A full checkpoint includes model, optimizer and train_state, which can be used to resume training.
     The default value is True.
     """
 
     export_dtype: Literal["float16", "bfloat16", "float32"] = "float32"
     """
-    Converts to the specified precision when training completes and last_save_model_weights_only=true.
+    Converts to the specified precision when training completes and last_save_model_only=true.
     """
 
     create_seed_checkpoint: bool = False
@@ -475,15 +486,15 @@ class Checkpoint:
     for many steps or checkpointing too frequently. The default value is False.
     """
 
-    last_save_in_safetensors_format: bool = False
+    last_save_in_hf: bool = False
     """
-    Enable the use of safetensors format for checkpointing. This will save the final checkpoints
-    in safetensors format instead of the default DCP format. There will be a performance
-    cost in using this as we need to consolidate the sharded tensors to full tensors as
-    a separate step. last_save_model_weights_only must be true because safetensors doesn't
-    support saving non tensors. On load, this argument isn't needed as we will detect
-    whether the loaded checkpoint is in safetensors format or not.
-    The default value is False.
+    Enable the use of Hugging Face's safetensors format for checkpointing. This will save the
+    final checkpoints in safetensors format instead of the default DCP format, after necessary
+    model state dict transformation. There will be a performance cost in using this as we need
+    to consolidate the sharded tensors to full tensors as a separate step.
+    last_save_model_only must be true because safetensors doesn't support saving
+    non-tensors. On load, this argument isn't needed as we will detect whether the loaded
+    checkpoint is in safetensors format or not. The default value is False.
     """
 
 
@@ -679,6 +690,18 @@ class FaultTolerance:
 
     This is only used when "semi_sync_method" is set.
     """
+
+    module_names_per_model_chunk: list[list[str]] = field(default_factory=list)
+    """
+    Specify a list of lists containing the FQNs (Fully Qualified Names) of modules for each model chunk.
+    Each inner list represents one model chunk and contains the module names that belong to that chunk.
+    e.g. [['tok_embeddings', 'layers.0'], ['layers.1', 'layers.2'], ['layers.3', 'layers.4']]
+    will create 3 chunks: the first containing tok_embeddings and layers.0,
+    the second containing layers.1 and layers.2, and the third containing layers.3 and layers.4.
+    This provides more explicit control over which modules belong to each chunk compared to split points.
+    """
+
+    num_fragments: int = 1
 
 
 @dataclass
