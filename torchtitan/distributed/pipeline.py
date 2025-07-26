@@ -6,6 +6,8 @@
 import os
 from typing import Callable
 
+from torch import nn
+
 from torch.distributed.pipelining.schedules import (
     _PipelineSchedule,
     _PipelineScheduleRuntime,
@@ -19,7 +21,13 @@ from torchtitan.config import JobConfig
 from torchtitan.tools.logging import logger
 
 
-__all__ = ["build_pipeline_schedule", "generate_split_points", "stage_ids_this_rank"]
+__all__ = [
+    "build_pipeline_schedule",
+    "generate_split_points",
+    "stage_ids_this_rank",
+    "generate_module_names_per_stage",
+    "module_split",
+]
 
 
 # TODO: It's unclear if this API is general enough to be used by other models.
@@ -209,3 +217,193 @@ def stage_ids_this_rank(
             zip(range(pp_size), range(num_stages - 1, pp_size - 1, -1))
         )
         return stage_v_pairs[pp_rank]
+
+
+def generate_module_names_per_stage(
+    num_stages: int,
+    num_layers: int,
+    input_weight: int = 1,
+    output_weight: int = 1,
+) -> list[list[str]]:
+    """
+    Programmatically generates module names per stage for pipeline parallelism with weighting.
+
+    Args:
+        num_stages: Number of pipeline stages
+        num_layers: Total number of transformer layers in the model
+        input_weight: Weight for input modules (tok_embeddings) in layer calculation
+        output_weight: Weight for output modules (norm + output) in layer calculation
+
+    Returns:
+        List of lists containing module names for each stage
+
+    Example:
+        generate_module_names_per_stage(2, 3, input_weight=2, output_weight=2)
+        treats embeddings as 2 layers and norm+output as 2 layers for distribution
+    """
+    if num_stages < 1:
+        raise ValueError("Number of stages must be at least 1")
+
+    if num_stages == 1:
+        # Single stage gets everything
+        layer_names = [f"layers.{i}" for i in range(num_layers)]
+        return [["tok_embeddings"] + layer_names + ["norm", "output"]]
+
+    # Calculate effective layers including weights
+    num_effective_layers = num_layers + input_weight + output_weight
+
+    if num_stages > num_effective_layers:
+        raise ValueError(
+            f"Number of stages ({num_stages}) cannot be greater than effective layers ({num_effective_layers})"
+        )
+
+    # Calculate layers per stage (distribute evenly)
+    layers_per_stage = num_effective_layers // num_stages
+    extra_layers = num_effective_layers % num_stages
+
+    # Ensure each stage gets at least the weight of input/output modules
+    if layers_per_stage < max(input_weight, output_weight):
+        raise ValueError(
+            f"Layers per stage ({layers_per_stage}) must be >= max(input_weight={input_weight}, output_weight={output_weight})"
+        )
+
+    module_names_per_stage = []
+    current_layer = 0
+
+    for stage_idx in range(num_stages):
+        stage_modules = []
+
+        # Calculate effective layers for this stage
+        effective_layers_for_stage = layers_per_stage
+        if stage_idx < extra_layers:
+            effective_layers_for_stage += 1
+
+        # First stage: handle input modules with weighting
+        if stage_idx == 0:
+            stage_modules.append("tok_embeddings")
+            # Account for input weight in layer distribution
+            remaining_layers_for_stage = effective_layers_for_stage - input_weight
+
+            # Add transformer layers
+            for _ in range(remaining_layers_for_stage):
+                if current_layer < num_layers:
+                    stage_modules.append(f"layers.{current_layer}")
+                    current_layer += 1
+
+        # Last stage: handle output modules with weighting
+        elif stage_idx == num_stages - 1:
+            # Account for output weight in layer distribution
+            remaining_layers_for_stage = effective_layers_for_stage - output_weight
+
+            # Add transformer layers
+            for _ in range(remaining_layers_for_stage):
+                if current_layer < num_layers:
+                    stage_modules.append(f"layers.{current_layer}")
+                    current_layer += 1
+
+            # Add output modules
+            stage_modules.extend(["norm", "output"])
+
+        # Middle stages: only transformer layers
+        else:
+            for _ in range(effective_layers_for_stage):
+                if current_layer < num_layers:
+                    stage_modules.append(f"layers.{current_layer}")
+                    current_layer += 1
+
+        module_names_per_stage.append(stage_modules)
+
+    return module_names_per_stage
+
+
+def module_split(
+    model: nn.Module,
+    module_names_per_stage: list[list[str]],
+) -> list[nn.Module]:
+    """
+    This API creates pipeline stages based on specified module names for each stage.
+    This method updates the model in place.
+
+    Args:
+        model: The complete model to be split
+        module_names_per_stage: List of lists, where each inner list contains the module names
+                               that should be included in that stage. Module names should be
+                               dot-separated paths. Examples:
+                               - "tok_embeddings" for token embeddings
+                               - "layers.0", "layers.1" for specific transformer layers
+                               - "norm" for the final normalization layer
+                               - "output" for the output projection layer
+
+    Returns:
+        List of model chunks
+
+    Example usage:
+        module_names_per_stage = [
+            ["tok_embeddings", "layers.0"],     # Stage 0: embeddings + first layer
+            ["layers.1", "layers.2"],           # Stage 1: middle layers
+            ["norm", "output"]                  # Stage 2: final norm + output
+        ]
+    """
+
+    def _build_stage_from_modules(stage_idx: int, module_names: list[str]) -> nn.Module:
+        stage_model = nn.Module()
+        # Create a set of modules to keep for faster lookup
+        modules_to_keep = set(module_names)
+        print(f"Stage {stage_idx}: Modules to keep: {modules_to_keep}")
+        for module_name, module_value in model.named_children():
+            # Handle layer-like structures (e.g., "layers.0", "layers.1")
+            if isinstance(module_value, (nn.ModuleDict, nn.ModuleList)):
+                layers_to_keep = {
+                    name.split(".", 1)[1]
+                    for name in modules_to_keep
+                    if name.startswith(f"{module_name}.")
+                }
+
+                if not layers_to_keep:
+                    continue
+
+                # Keep only specified layers
+                if isinstance(module_value, nn.ModuleDict):
+                    for layer_name in list(module_value.keys()):
+                        if layer_name in layers_to_keep:
+                            setattr(
+                                stage_model,
+                                f"{module_name}.{layer_name}",
+                                module_value[layer_name],
+                            )
+                else:
+                    indices_to_keep = {
+                        int(idx) for idx in layers_to_keep if idx.isdigit()
+                    }
+                    new_layers = nn.ModuleList(
+                        [
+                            layer
+                            for i, layer in enumerate(module_value)
+                            if i in indices_to_keep
+                        ]
+                    )
+                    setattr(stage_model, module_name, new_layers)
+
+                continue
+
+            # Handle simple module attributes (e.g., "linear", "norm")
+            if module_name not in modules_to_keep:
+                continue
+
+            setattr(stage_model, module_name, module_value)
+
+        return stage_model
+
+    num_stages = len(module_names_per_stage)
+    models = []
+
+    for stage_idx in range(num_stages):
+        module_names = module_names_per_stage[stage_idx]
+        model_chunk = _build_stage_from_modules(
+            stage_idx,
+            module_names,
+        )
+        logger.info(f"building stage_idx {stage_idx} " f"with modules {module_names}")
+        models.append(model_chunk)
+
+    return models
