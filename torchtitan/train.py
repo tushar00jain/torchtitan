@@ -8,7 +8,7 @@ import importlib
 import os
 import time
 from datetime import timedelta
-from typing import Any, Generator, Iterable, Optional
+from typing import Any, Generator, Iterable, Optional, cast
 
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -43,6 +43,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     tokenizer: train_spec_module.BaseTokenizer | None
     dataloader: train_spec_module.BaseDataLoader
     model_parts: list[torch.nn.Module]
+    ft_model_parts: list[torch.nn.Module]
     loss_fn: train_spec_module.LossFunction
     optimizers: train_spec_module.OptimizersContainer
     lr_schedulers: train_spec_module.LRSchedulersContainer
@@ -260,6 +261,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             model.train()
 
             self.model_parts = [model]
+
+            ft = job_config.fault_tolerance
+
+            if ft.enable:
+                train_spec = cast(train_spec_module.FaultTolerantTrainSpec, self.train_spec)
+                if train_spec.fragment_fn:
+                    self.ft_model_parts = train_spec.fragment_fn(model, job_config, model_args)
+                else:
+                    self.ft_model_parts = [model]
+
 
         self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
 
@@ -524,7 +535,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             maybe_semi_sync_training(
                 job_config.fault_tolerance,
                 ft_manager=self.ft_manager,
-                model_parts=self.model_parts,
+                model_parts=self.ft_model_parts,
                 optimizer=self.optimizers,
             ),
         ):
