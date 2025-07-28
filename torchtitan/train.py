@@ -216,6 +216,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.loss_fn, self.gradient_accumulation_steps
         )
 
+        self.ft_model_parts = []
+
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:
             if not self.train_spec.pipelining_fn:
