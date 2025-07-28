@@ -44,12 +44,15 @@ def maybe_enable_profiling(
             if not os.path.exists(curr_trace_dir):
                 os.makedirs(curr_trace_dir, exist_ok=True)
 
+            if leaf_folder != "":
+                curr_trace_dir = os.path.join(curr_trace_dir, leaf_folder)
+                if not os.path.exists(curr_trace_dir):
+                    os.makedirs(curr_trace_dir, exist_ok=True)
+
             logger.info(f"Dumping profiler traces at step {prof.step_num}")
             begin = time.monotonic()
 
-            output_file = os.path.join(
-                curr_trace_dir, leaf_folder, f"rank{rank}_trace.json"
-            )
+            output_file = os.path.join(curr_trace_dir, f"rank{rank}_trace.json")
             prof.export_chrome_trace(output_file)
             logger.info(
                 f"Finished dumping profiler traces in {time.monotonic() - begin:.2f} seconds"
