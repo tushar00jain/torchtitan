@@ -40,7 +40,7 @@ def maybe_enable_profiling(
 
         def trace_handler(prof):
             curr_trace_dir_name = "iteration_" + str(prof.step_num)
-            curr_trace_dir = os.path.join(trace_dir, curr_trace_dir_name)
+            curr_trace_dir = os.path.join(trace_dir, curr_trace_dir_name, leaf_folder)
             if not os.path.exists(curr_trace_dir):
                 os.makedirs(curr_trace_dir, exist_ok=True)
 
