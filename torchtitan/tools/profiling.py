@@ -126,13 +126,13 @@ def maybe_enable_memory_snapshot(
                     # dump as iteration_0_exit if OOM at iter 1
                     curr_step = self.step_num - 1
                     dir_name = f"iteration_{curr_step}_exit"
-                curr_snapshot_dir = os.path.join(snapshot_dir, dir_name)
+                curr_snapshot_dir = os.path.join(snapshot_dir, dir_name, leaf_folder)
                 if not os.path.exists(curr_snapshot_dir):
                     os.makedirs(curr_snapshot_dir, exist_ok=True)
                 logger.info(f"Dumping memory snapshot at step {curr_step}")
                 begin = time.monotonic()
                 output_file = os.path.join(
-                    curr_snapshot_dir, leaf_folder, f"rank{rank}_memory_snapshot.pickle"
+                    curr_snapshot_dir, f"rank{rank}_memory_snapshot.pickle"
                 )
                 with open(output_file, "wb") as output:
                     pickle.dump(torch.cuda.memory._snapshot(), output)
