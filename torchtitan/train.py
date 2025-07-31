@@ -38,6 +38,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     job_config: JobConfig
     parallel_dims: ParallelDims
     train_spec: train_spec_module.TrainSpec
+    model_args: train_spec_module.BaseModelArgs
 
     # swappable training components in TrainSpec
     tokenizer: train_spec_module.BaseTokenizer | None
@@ -146,6 +147,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model_args = self.train_spec.model_args[job_config.model.flavor]
         # set the model args from training job configs
         model_args.update_from_config(job_config)
+        self.model_args = model_args
 
         logger.info(
             f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
@@ -529,8 +531,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             maybe_semi_sync_training(
                 job_config.fault_tolerance,
                 ft_manager=self.ft_manager,
-                model_parts=self.model_parts,
+                model=self.model_parts[0],
+                model_args=self.model_args,
                 optimizer=self.optimizers,
+                train_spec=self.train_spec,
             ),
         ):
             data_iterator = self.batch_generator(self.dataloader)

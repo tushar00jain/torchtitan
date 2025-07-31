@@ -7,13 +7,14 @@
 import importlib
 from contextlib import nullcontext
 from datetime import timedelta
-from typing import ContextManager, Optional, TYPE_CHECKING, Union
+from typing import ContextManager, Optional, TYPE_CHECKING, Union, cast
 
 import torch
 import torch.distributed as dist
 from torch.distributed._composable.fsdp.fully_shard import FSDPModule
 from torch.distributed.distributed_c10d import ReduceOp
 from torchtitan.config.job_config import FaultTolerance as FTConfig
+from torchtitan.protocols.train_spec import BaseModelArgs, FaultTolerantTrainSpec, TrainSpec
 
 if importlib.util.find_spec("torchft") is not None:
     import torchft as ft
@@ -108,8 +109,10 @@ class FTManager:
 def maybe_semi_sync_training(
     ft_config: FTConfig,
     ft_manager: FTManager,
-    model_parts: list[torch.nn.Module],
+    model: torch.nn.Module,
+    model_args: BaseModelArgs,
     optimizer: torch.optim.Optimizer,
+    train_spec: TrainSpec,
 ) -> ContextManager[Union["local_sgd.DiLoCo", "local_sgd.LocalSGD", None]]:
     """
     If TorchFT is enabled and the config is set, use semi_sync_method
@@ -122,6 +125,16 @@ def maybe_semi_sync_training(
             ft_manager._manager is not None
         ), "FTManager must be enabled to use semi-sync training."
         if semi_sync_method.lower() == "diloco":
+            train_spec = cast(
+                FaultTolerantTrainSpec, train_spec
+            )
+            if train_spec.fragment_fn:
+                model_parts = train_spec.fragment_fn(
+                    model, ft_config, model_args
+                )
+            else:
+                model_parts = [model]
+
             # Create the outer optimizer based on the inner optimizer parameters.
             outer_optimizers = []
             for model in model_parts:
@@ -142,10 +155,10 @@ def maybe_semi_sync_training(
                 fragment_update_alpha=ft_config.fragment_update_alpha,
             )
         elif semi_sync_method.lower() == "local_sgd":
-            assert len(model_parts) == 1
+            assert len(model) == 1
             return local_sgd.LocalSGD(
                 manager=ft_manager._manager,
-                model=model_parts[0],
+                model=model,
                 optimizer=optimizer,
                 sync_every=ft_config.sync_steps,
             )
