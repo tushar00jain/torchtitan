@@ -10,6 +10,7 @@
 from dataclasses import dataclass
 
 from torch import nn
+from torchtitan.components.ft.protocol import FaultTolerantModelArgs
 
 from torchtitan.config import JobConfig
 from torchtitan.protocols.train_spec import BaseModelArgs
@@ -17,7 +18,7 @@ from torchtitan.tools.logging import logger
 
 
 @dataclass
-class TransformerModelArgs(BaseModelArgs):
+class TransformerModelArgs(FaultTolerantModelArgs, BaseModelArgs):
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32
