@@ -6,14 +6,18 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeAlias
+
+# Import only the type we need for type checking
+from typing import TYPE_CHECKING, TypeAlias
 
 import torch.nn as nn
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.loss import LossFunction
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+
+if TYPE_CHECKING:
+    from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.tokenizer import BaseTokenizer
@@ -33,7 +37,7 @@ TokenizerBuilder: TypeAlias = Callable[..., BaseTokenizer]
 MetricsProcessorBuilder: TypeAlias = Callable[..., MetricsProcessor]
 OptimizersBuilder: TypeAlias = Callable[..., OptimizersContainer]
 LRSchedulersBuilder: TypeAlias = Callable[
-    [OptimizersContainer, LRScheduler, int], LRSchedulersContainer
+    [OptimizersContainer, LRScheduler, int], "LRSchedulersContainer"
 ]
 LossFunctionBuilder: TypeAlias = Callable[..., LossFunction]
 ValidatorBuilder: TypeAlias = Callable[..., BaseValidator]

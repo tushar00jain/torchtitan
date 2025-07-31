@@ -8,12 +8,15 @@ import importlib
 import os
 import time
 from datetime import timedelta
-from typing import Any, Generator, Iterable, Optional
+from typing import Any, Generator, Iterable, Optional, TYPE_CHECKING
 
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.protocols.train_spec as train_spec_module
+
+if TYPE_CHECKING:
+    from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderStopIteration
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
@@ -45,9 +48,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     model_parts: list[torch.nn.Module]
     loss_fn: train_spec_module.LossFunction
     optimizers: train_spec_module.OptimizersContainer
-    lr_schedulers: train_spec_module.LRSchedulersContainer
+    lr_schedulers: "LRSchedulersContainer"
     validator: train_spec_module.BaseValidator
     metrics_processor: train_spec_module.MetricsProcessor
+    model_args: train_spec_module.BaseModelArgs
 
     # non-swappable training components
     checkpointer: CheckpointManager
@@ -146,6 +150,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model_args = self.train_spec.model_args[job_config.model.flavor]
         # set the model args from training job configs
         model_args.update_from_config(job_config)
+        self.model_args = model_args
 
         logger.info(
             f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
@@ -545,8 +550,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             maybe_semi_sync_training(
                 job_config.fault_tolerance,
                 ft_manager=self.ft_manager,
-                model_parts=self.model_parts,
+                model=self.model_parts[0],
+                model_args=self.model_args,
                 optimizer=self.optimizers,
+                train_spec=self.train_spec,
             ),
         ):
             data_iterator = self.batch_generator(self.dataloader)
