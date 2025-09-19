@@ -644,20 +644,24 @@ class CheckpointManager:
         step = self._find_load_step(folder=self._ft_folder())
         if step == -1:
             return
+        try:
+            begin = time.monotonic()
+            logger.info(f"Loading the FT checkpoint at step {step}.")
+            checkpoint_id = self._create_checkpoint_id(step, folder=self._ft_folder())
+            self.dcp_load(
+                self.ft_states,
+                checkpoint_id=checkpoint_id,
+                # FT checkpoints are always DCP because FT checkpoint currently only save/load dataloader.
+                from_hf=False,
+            )
+            GarbageCollection.collect("GC collection for checkpoint loading.")
+            logger.info(
+                f"Finished loading the ft checkpoint in {time.monotonic() - begin:.2f} seconds."
+            )
+        except Exception as e:
+            # It's ok if we're not able to load the FT checkpoint.
+            return
 
-        begin = time.monotonic()
-        logger.info(f"Loading the FT checkpoint at step {step}.")
-        checkpoint_id = self._create_checkpoint_id(step, folder=self._ft_folder())
-        self.dcp_load(
-            self.ft_states,
-            checkpoint_id=checkpoint_id,
-            # FT checkpoints are always DCP because FT checkpoint currently only save/load dataloader.
-            from_hf=False,
-        )
-        GarbageCollection.collect("GC collection for checkpoint loading.")
-        logger.info(
-            f"Finished loading the ft checkpoint in {time.monotonic() - begin:.2f} seconds."
-        )
 
     def _flattened_model_states_sd(
         self, state_dict: dict[str, Any] | None = None
