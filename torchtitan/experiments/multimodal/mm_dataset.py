@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
@@ -16,12 +15,13 @@ from mm_collator import MultiModalCollator
 from tokenizer.tiktoken import BaseTokenizer, IGNORE_INDEX
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
+from transform import CLIPTransform
+from utils import load_image
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.config import JobConfig
+from torchtitan.datasets import DatasetConfig
 from torchtitan.tools.logging import logger
-from transform import CLIPTransform
-from utils import load_image
 
 
 def _load_obelics_dataset(dataset_path: str):
@@ -51,13 +51,6 @@ def _process_obelics_sample(
         "images": [load_image(image) for image in sample_images],
         "text": "".join(map(str, sample_text)),
     }
-
-
-@dataclass
-class DatasetConfig:
-    path: str
-    loader: Callable
-    sample_processor: Callable
 
 
 # Add your dataset here here - more information at docs/datasets.md

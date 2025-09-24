@@ -144,7 +144,9 @@ class WandBLogger(BaseLogger):
         os.makedirs(log_dir, exist_ok=True)
 
         self.wandb.init(
+            entity=os.getenv("WANDB_TEAM", None),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
+            name=os.getenv("WANDB_RUN_NAME", None),
             dir=log_dir,
             config=job_config.to_dict(),
         )
@@ -160,6 +162,28 @@ class WandBLogger(BaseLogger):
     def close(self) -> None:
         if self.wandb.run is not None:
             self.wandb.finish()
+
+
+class LoggerContainer(BaseLogger):
+    """Container to call all loggers enabled in the job config."""
+
+    def __init__(self) -> None:
+        self._loggers: list[BaseLogger] = []
+
+    def add_logger(self, logger_instance: BaseLogger) -> None:
+        self._loggers.append(logger_instance)
+
+    def log(self, metrics: dict[str, Any], step: int) -> None:
+        for logger_instance in self._loggers:
+            logger_instance.log(metrics, step)
+
+    @property
+    def number_of_loggers(self) -> int:
+        return len(self._loggers)
+
+    def close(self) -> None:
+        for logger_instance in self._loggers:
+            logger_instance.close()
 
 
 def ensure_pp_loss_visible(
@@ -272,11 +296,15 @@ def _build_metric_logger(
             base_log_dir, f"rank_{torch.distributed.get_rank()}"
         )
 
+    # Create logger container
+    logger_container = LoggerContainer()
+
     # Create loggers in priority order
     if metrics_config.enable_wandb:
         logger.debug("Attempting to create WandB logger")
         try:
-            return WandBLogger(base_log_dir, job_config, tag)
+            wandb_logger = WandBLogger(base_log_dir, job_config, tag)
+            logger_container.add_logger(wandb_logger)
         except Exception as e:
             if "No module named 'wandb'" in str(e):
                 logger.error(
@@ -287,10 +315,12 @@ def _build_metric_logger(
 
     if metrics_config.enable_tensorboard:
         logger.debug("Creating TensorBoard logger")
-        return TensorBoardLogger(base_log_dir, tag)
+        tensorboard_logger = TensorBoardLogger(base_log_dir, tag)
+        logger_container.add_logger(tensorboard_logger)
 
-    logger.debug("No loggers enabled, returning BaseLogger")
-    return BaseLogger()
+    if logger_container.number_of_loggers == 0:
+        logger.debug("No loggers enabled, returning an emtpy LoggerContainer")
+    return logger_container
 
 
 class MetricsProcessor:
@@ -319,6 +349,7 @@ class MetricsProcessor:
     num_flops_per_token: int
     optimizers: OptimizersContainer | None
     lr_schedulers: LRSchedulersContainer | None
+    model_parts: list[torch.nn.Module] | None
 
     def __init__(
         self,
@@ -349,6 +380,7 @@ class MetricsProcessor:
         self.num_flops_per_token = -1
         self.optimizers = None
         self.lr_schedulers = None
+        self.model_parts = None
 
     def should_log(self, step: int) -> bool:
         return step == 1 or step % self.job_config.metrics.log_freq == 0

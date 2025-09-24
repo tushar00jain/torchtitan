@@ -16,7 +16,7 @@ class Training:
     img_size: int = 256
     """Image width to sample"""
     test_mode: bool = False
-    """Whether to use intergration test mode, which will randomly initialize the encoder and use a dummy tokenizer"""
+    """Whether to use integration test mode, which will randomly initialize the encoder and use a dummy tokenizer"""
 
 
 @dataclass
@@ -55,11 +55,26 @@ class Validation:
 
 
 @dataclass
+class Inference:
+    """Inference configuration"""
+
+    save_img_folder: str = "inference_results"
+    """Path to save the inference results"""
+    prompts_path: str = "./torchtitan/experiments/flux/inference/prompts.txt"
+    """Path to file with newline separated prompts to generate images for"""
+    local_batch_size: int = 2
+    """Batch size for inference"""
+    img_size: int = 256
+    """Image size for inference"""
+
+
+@dataclass
 class JobConfig:
     """
-    Extend the tyro parser with custom config classe for Flux model.
+    Extend the tyro parser with custom config classes for Flux model.
     """
 
     training: Training = field(default_factory=Training)
     encoder: Encoder = field(default_factory=Encoder)
     validation: Validation = field(default_factory=Validation)
+    inference: Inference = field(default_factory=Inference)

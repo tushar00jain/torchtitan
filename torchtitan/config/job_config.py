@@ -19,9 +19,6 @@ class Job:
     description: str = "default job"
     """Description of the job"""
 
-    use_for_integration_test: bool = False
-    """Add this config to the integration test suite"""
-
     print_args: bool = False
     """Print the args to terminal"""
 
@@ -35,7 +32,13 @@ class Profiling:
     """Trace files location"""
 
     profile_freq: int = 10
-    """How often to collect profile traces, in interations"""
+    """How often to collect profile traces, in iterations"""
+
+    profiler_active: int = 1
+    """The steps profiler is active for"""
+
+    profiler_warmup: int = 3
+    """The number of warmup steps before the active step in each profiling cycle"""
 
     enable_memory_snapshot: bool = False
     """Whether to dump memory snapshot"""
@@ -78,7 +81,15 @@ class Model:
     flavor: str = "debugmodel"
     """Which model config to train"""
 
-    tokenizer_path: str = "./tests/assets/tokenizer"
+    hf_assets_path: str = "./tests/assets/tokenizer"
+    """
+    Path to HF assets folder. This folder contains local copies of Hugging Face assets,
+    including model weights in .safetensors format, the model.safetensor.index.json file
+    (fqn to file mapping), the config.json file, generation_config.json, and tokenizer files.
+    """
+
+    tokenizer_path: str | None = None
+    """DEPRECATED: Use hf_assets_path instead."""
     """Tokenizer path"""
 
     converters: list[str] = field(default_factory=list)
@@ -196,6 +207,13 @@ class Training:
     Whether to apply CPU offloading of parameters, gradients, and optimizer states in FSDP
     """
 
+    dtype: Literal["bfloat16", "float32"] = "float32"
+    """
+    torch dtype for training. In contrast to mixed precision training, setting training_dtype=bfloat16 will
+    put all parameters, gradients, and optimizer states in bfloat16, without an extra copy of fp32 weights.
+    In the case of full bf16 training, RoPE calculations and logits will still be in fp32.
+    """
+
     mixed_precision_param: Literal["bfloat16", "float32"] = "bfloat16"
     """
     torch dtype to use for parameters when applying mixed precision via fully_shard or torch.autocast.
@@ -209,9 +227,6 @@ class Training:
     torch dtype to use for reductions when applying mixed precision via FSDP.
     This feature only takes effect when data_parallel_shard_degree > 1
     """
-
-    compile: bool = False
-    """Whether to compile the model"""
 
     gc_freq: int = 50
     """Python garbage control scheduling interval, in steps"""
@@ -366,22 +381,40 @@ class Parallelism:
 
     expert_parallel_degree: int = 1
     """
-    Expert parallelism degree. 1 means disabled.
-    Currently, only "dp2ep" is supported, with the following constraints:
-    context_parallel_degree <= expert_parallel_degree <= data_parallel_shard_degree * context_parallel_degree
+    Expert parallelism degree. 1 means disabled. No effect for non-MoE models.
+    Currently, it is supported with the following constraints:
+    - when etp = tp:
+      - cp <= ep <= dp_shard * cp
+      - ep % cp == 0
+      - dp_shard * cp % ep == 0
+    - when etp = 1:
+      - cp * tp <= ep <= dp_shard * cp * tp
+      - ep % (cp * tp) == 0
+      - dp_shard * cp * tp % ep == 0
+    Note that this is still an experimental feature. Some constraints will be
+    relaxed soon when we have more flexible DeviceMesh support.
+    """
+
+    expert_tensor_parallel_degree: int = 1
+    """
+    Expert tensor parallelism degree. 1 means disabled. No effect for non-MoE models, or when ep = 1.
+    With this option, the tensor parallel degree on routed experts can be different from that on other params.
+    Currently, we only support either
+    - [partial dp -> ep] etp = tp
+    - [partial dp + all tp -> ep] etp = 1
     Note that this is still an experimental feature.
     """
 
 
 @dataclass
 class Checkpoint:
-    enable_checkpoint: bool = False
+    enable: bool = False
     """Whether to enable checkpoint"""
 
     folder: str = "checkpoint"
     """
     The folder to store the checkpoints.
-    When enable_checkpoint is set to true, checkpoints will be in {--job.dump_folder}/{--checkpoint.folder}.
+    When enable is set to true, checkpoints will be in {--job.dump_folder}/{--checkpoint.folder}.
     """
 
     interval: int = 500
@@ -523,6 +556,23 @@ class ActivationCheckpoint:
     ANY mm with shape matching (*, in) x (in, out) will be force recomputed.
     """
 
+    early_stop: bool = False
+    """
+    Whether to stop recomputing early when all activations have already been
+    rematerialized.
+    """
+
+
+@dataclass
+class Compile:
+    enable: bool = False
+    """Whether to apply torch.compile"""
+
+    components: list[Literal["model", "loss"]] = field(
+        default_factory=lambda: ["model", "loss"]
+    )
+    """Which components to compile"""
+
 
 @dataclass
 class Float8:
@@ -601,10 +651,13 @@ class Comm:
     save_traces_folder: str = "comm_traces"
     """Flight recorder trace files location"""
 
+    save_traces_file_prefix: str = "rank_"
+    """Flight recorder trace files prefix"""
+
 
 @dataclass
 class MemoryEstimation:
-    enabled: bool = False
+    enable: bool = False
     """Whether to estimate memory usage for FSDP"""
 
     disable_fake_mode: bool = False
@@ -676,7 +729,7 @@ class Experimental:
 
 @dataclass
 class Validation:
-    enabled: bool = False
+    enable: bool = False
     """Enable validation to default run validation after each training loop"""
 
     dataset: str = "c4_validation"
@@ -695,7 +748,10 @@ class Validation:
     """Frequency of validation"""
 
     steps: int = -1
-    """Number of steps to take in the validation set, -1 means consuming all the data in the validation dataset"""
+    """
+    Number of steps to take in the validation set, -1 means consuming all the data in the validation dataset
+    WARNING: When setting to -1 there could be hangs due to mismatch among ranks
+    """
 
     def __post_init__(self):
         assert (
@@ -721,6 +777,7 @@ class JobConfig:
     activation_checkpoint: ActivationCheckpoint = field(
         default_factory=ActivationCheckpoint
     )
+    compile: Compile = field(default_factory=Compile)
     float8: Float8 = field(default_factory=Float8)
     mx: MX = field(default_factory=MX)
     comm: Comm = field(default_factory=Comm)

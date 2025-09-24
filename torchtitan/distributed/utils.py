@@ -122,10 +122,10 @@ def set_determinism(
         torch.distributed.broadcast(seed_tensor, src=0)
         seed = seed_tensor.to("cpu").view(torch.uint64).item()
 
-    # Set distinct seed for each rank in mesh dimensions, with dimension name provdied by `distinct_seed_mesh_dim`
+    # Set distinct seed for each rank in mesh dimensions, with dimension name provided by `distinct_seed_mesh_dim`
     # For PP + SPMD cases, we want to separate the world into the SPMD mesh and the PP mesh,
     # and choose a unique seed for each rank on the PP mesh.
-    # TODO(jianiw): We could further extend this to support mutiple distinct dimensions instead of just one.
+    # TODO(jianiw): We could further extend this to support multiple distinct dimensions instead of just one.
     if (
         c10d.get_world_size() > 1
         and distinct_seed_mesh_dim in world_mesh.mesh_dim_names
@@ -206,9 +206,7 @@ def get_train_context(
 
                 if SDPBackend.MATH in ScaledDotProductAttention.backends:
                     ScaledDotProductAttention.backends.remove(SDPBackend.MATH)
-                assert (
-                    ScaledDotProductAttention.backends
-                ), "No valid SDPA backends with CP."
+
                 stack.enter_context(cp_context)
 
             yield
@@ -260,7 +258,7 @@ def init_distributed(
         return backend
 
     TRACE_BUFFER_SIZE = "TORCH_FR_BUFFER_SIZE"
-    TRACE_FILE = "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"
+    TRACE_FILE = "TORCH_FR_DUMP_TEMP_FILE"
     DUMP_ON_TIMEOUT = "TORCH_NCCL_DUMP_ON_TIMEOUT"
     ASYNC_ERROR_HANDLING = "TORCH_NCCL_ASYNC_ERROR_HANDLING"
     SKIP_CLEANUP = "3"
@@ -277,8 +275,9 @@ def init_distributed(
         # dump on timeout by default if trace buffer is enabled
         _warn_overwrite_env(DUMP_ON_TIMEOUT, "1")
         dump_dir = os.path.join(base_folder, comm_config.save_traces_folder)
+        prefix = comm_config.save_traces_file_prefix
         os.makedirs(dump_dir, exist_ok=True)
-        _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/rank_")
+        _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/{prefix}")
 
     torch.distributed.init_process_group(
         backend=_get_distributed_backend(enable_cpu_backend),
@@ -420,7 +419,12 @@ def _clip_grad_norm_with_ep(
             non_ep_grads.append(p.grad)
     ep_grads_total_norm = torch.nn.utils.get_total_norm(
         ep_grads, norm_type, error_if_nonfinite, foreach
-    ).full_tensor()
+    )
+    # ep_grads may be an empty list, in which case get_total_norm returns tensor(0.), a non-DTensor
+    # This can occur in PP + EP setups where certain PP ranks only own non-EP layers, for instance.
+    if isinstance(ep_grads_total_norm, DTensor):
+        ep_grads_total_norm = ep_grads_total_norm.full_tensor()
+
     non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
         non_ep_grads, norm_type, error_if_nonfinite, foreach
     ).full_tensor()
@@ -445,3 +449,9 @@ def _clip_grad_norm_with_ep(
     torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
 
     return total_norm
+
+
+def _round_up(x: int, y: int) -> int:
+    """Round up x to the nearest multiple of y."""
+    x_ceil_div_y = (x + y - 1) // y
+    return x_ceil_div_y * y
