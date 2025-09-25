@@ -32,6 +32,7 @@ from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
     maybe_enable_profiling,
 )
+import signal
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
@@ -588,6 +589,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 ),
             ),
         ):
+            if torch_profiler:
+                def sigabrt_handler(signal, frame):
+                    logger.info("SIGABRT received. Stopping profiler")
+                    for _ in range(config.profiling.profiler_active):
+                        # Step the profiler enough times to trigger a trace
+                        torch_profiler.step()
+                    torch_profiler.stop()
+                signal.signal(signal.SIGABRT, sigabrt_handler)
+
             data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1
