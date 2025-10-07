@@ -414,6 +414,17 @@ class Checkpoint:
     enable: bool = False
     """Whether to enable checkpoint"""
 
+    enable_ft_checkpoints: bool = True
+    """
+    Used to enable checkpointing state that's used for fault tolerant training with torchft.
+
+    Fault tolerant training stores data loader index in the checkpoints, so that training
+    can resume without going over the same batch twice.
+
+    If enabled, data loader state is checkpointed. Otherwise the data loader index
+    will be infered from the step count.
+    """
+
     folder: str = "checkpoint"
     """
     The folder to store the checkpoints.
