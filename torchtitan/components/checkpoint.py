@@ -190,7 +190,11 @@ class CheckpointManager:
         ft_manager: FTManager | None = None,
     ) -> None:
         self.enable = checkpoint_config.enable
-        self.load_only = checkpoint_config.load_only
+        self.enable_ft_checkpoints = (
+            ft_manager is not None
+            and ft_manager.enabled
+            and checkpoint_config.enable_ft_checkpoints
+        )
 
         self.ft_manager = (
             ft_manager.manager if ft_manager and ft_manager.enabled else None
@@ -222,9 +226,6 @@ class CheckpointManager:
         self.enable_staging = (
             self.enable and async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM
         ) or self.ft_manager
-
-        if not self.enable and self.ft_manager is None:
-            return
 
         self.states = states
         self.states.update(
@@ -465,7 +466,7 @@ class CheckpointManager:
             None
         """
 
-        if self.ft_manager:
+        if self.enable_ft_checkpoints:
             self._ft_save(curr_step)
 
         if not self._should_save(curr_step, last_step):
@@ -535,6 +536,9 @@ class CheckpointManager:
         Returns:
             bool: Whether the checkpoint was loaded successfully.
         """
+
+        if not self.enable_ft_checkpoints:
+            return False
 
         if self.ft_manager:
             self._ft_load()
@@ -762,7 +766,7 @@ class CheckpointManager:
         )
 
     def _should_save(self, curr_step: int, last_step: bool = False) -> bool:
-        if not self.enable or self.load_only:
+        if not self.enable:
             return False
 
         if curr_step == 1 and self.enable_first_step_checkpoint:
