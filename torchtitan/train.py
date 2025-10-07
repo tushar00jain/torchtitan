@@ -638,6 +638,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
         self.ntokens_seen = state_dict["ntokens_seen"]
+        if (
+            self.job_config.fault_tolerance.enable
+            and not self.job_config.checkpoint.enable_ft_checkpoints
+        ):
+            # TODO: set index in the dataloader
+            pass
 
     def close(self) -> None:
         if self.checkpointer:

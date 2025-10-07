@@ -193,7 +193,7 @@ class CheckpointManager:
         self.load_only = checkpoint_config.load_only
 
         self.ft_manager = (
-            ft_manager.manager if ft_manager and ft_manager.enabled else None
+            ft_manager.manager if ft_manager and ft_manager.enabled and checkpoint_config.enable_ft_checkpoints else None
         )
         if self.ft_manager:
             optimizers.init_cache_state_dict()
