@@ -193,17 +193,20 @@ class CheckpointManager:
             ft_manager.manager
             if ft_manager
             and ft_manager.enabled
-            and checkpoint_config.enable_ft_dataloader_checkpoints
             else None
         )
 
-        if ft_manager and ft_manager.enabled and not self.ft_manager:
+        self.enable_ft_dataloader_checkpoints = (
+            self.ft_manager is not None and checkpoint_config.enable_ft_dataloader_checkpoints
+        )
+
+        if self.ft_manager is not None and not self.enable_ft_dataloader_checkpoints:
             logger.warn(
                 "Fault tolerance is enabled but enable_ft_dataloader_checkpoints is False. "
                 "This means replicas can retrain over the same data multiple times, which can result in overfitting."
             )
 
-        if self.ft_manager:
+        if self.ft_manager is not None:
             optimizers.init_cache_state_dict()
 
             def state_dict():
@@ -229,20 +232,22 @@ class CheckpointManager:
         async_mode = checkpoint_config.async_mode.lower()
         self.enable_staging = (
             self.enable and async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM
-        ) or self.ft_manager
+        ) or self.enable_ft_dataloader_checkpoints
 
-        if not self.enable and self.ft_manager is None:
+        if self.enable or self.ft_manager is not None:
+            self.states = states
+            self.states.update(
+                {
+                    MODEL: ModelWrapper(model_parts),
+                    OPTIMIZER: optimizers,
+                    DATALOADER: dataloader,
+                    LR_SCHEDULER: lr_schedulers,
+                }
+            )
+
+        if not self.enable and not self.enable_ft_dataloader_checkpoints:
             return
 
-        self.states = states
-        self.states.update(
-            {
-                MODEL: ModelWrapper(model_parts),
-                OPTIMIZER: optimizers,
-                DATALOADER: dataloader,
-                LR_SCHEDULER: lr_schedulers,
-            }
-        )
         self.ft_states = {DATALOADER: dataloader}
 
         self.staging = False
@@ -279,7 +284,7 @@ class CheckpointManager:
         if (
             async_mode == AsyncMode.ASYNC
             or async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM
-            or self.ft_manager
+            or self.enable_ft_dataloader_checkpoints
         ):
             self.pg = dist.new_group(backend="gloo")
 
@@ -480,7 +485,7 @@ class CheckpointManager:
             None
         """
 
-        if self.ft_manager:
+        if self.enable_ft_dataloader_checkpoints:
             self._ft_save(curr_step)
 
         if not self._should_save(curr_step, last_step):
@@ -551,7 +556,7 @@ class CheckpointManager:
             bool: Whether the checkpoint was loaded successfully.
         """
 
-        if self.ft_manager:
+        if self.enable_ft_dataloader_checkpoints:
             self._ft_load()
 
         if not self.enable:
@@ -749,7 +754,7 @@ class CheckpointManager:
 
         states_to_load = self._flattened_model_states_sd(states_to_load)
 
-        if self.ft_manager:
+        if self.enable_ft_dataloader_checkpoints:
             states_to_load.pop(DATALOADER)
 
         return states_to_load
