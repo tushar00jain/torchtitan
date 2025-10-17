@@ -4,9 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-
-from typing import Callable, Literal
-
 import torch
 import torch.nn as nn
 from torch.distributed._functional_collectives import (
@@ -17,42 +14,29 @@ from torch.distributed.tensor import (
     DeviceMesh,
     distribute_module,
     distribute_tensor,
+    DTensor,
+    Partial,
+    Replicate,
     Shard,
 )
 from torch.distributed.tensor.parallel import ParallelStyle
 
-from torchtitan.tools.utils import _round_up
-
-
-TOKEN_GROUP_ALIGN_SIZE_M = 8
-ValidTokenGroupAlignmentSize = Literal[8, 16, 32]
-
-
-def set_token_group_alignment_size_m(
-    alignment_size: ValidTokenGroupAlignmentSize,
-) -> None:
-    """
-    Set the token group alignment size for token groups in MoE. This is implemented by
-    padding each token group size to the next multiple of TOKEN_GROUP_ALIGN_SIZE_M.
-
-    Valid values are: 8, 16, or 32.
-    Different values are needed for different cases:
-
-    * For bf16, 8 is enough (16 byte alignment / 2 bytes per elem = 8 elements).
-    * For fp8, 16 byte alignment / 1 byte per elem = 16 elements.
-    * For mxfp8, we need 32 (or block_size) because scaling block size is (1 x 32),
-      so when doing per-token-group quantization on each logically distinct subtensor,
-      we need to ensure the contracting dim is divisible by block_size.
-      In the backward pass, grad_weight = (grad_output_t @ input).t() has gemm dims
-      of (N, M) @ (M, K) so M is the contracting dim, and group offsets are along M,
-      so we need 32 element alignment.
-    """
-    global TOKEN_GROUP_ALIGN_SIZE_M
-    TOKEN_GROUP_ALIGN_SIZE_M = alignment_size
+from torchtitan.models.moe.utils import _permute, _unpermute
 
 
 # implementation of Tensor Parallel for the GroupedExperts in MoE
 class TensorParallel(ParallelStyle):
+    def _prepare_input_fn(self, mod, inputs, device_mesh):
+        routed_input, num_tokens_per_expert = inputs
+        # NOTE: Currently in MoE TP, experts multiplication runs in plain Tensors.
+        #       The grad_placements on inputs is set to Partial so that necessary
+        #       reductions are performed during backward.
+        routed_input = DTensor.from_local(
+            routed_input, device_mesh, (Replicate(),)
+        ).to_local(grad_placements=(Partial(),))
+
+        return routed_input, num_tokens_per_expert
+
     def _partition_fn(self, name, module, device_mesh):
         # w1 shape = (experts, out_dim, in_dim)
         module.register_parameter(
@@ -76,6 +60,7 @@ class TensorParallel(ParallelStyle):
             module,
             device_mesh,
             self._partition_fn,
+            self._prepare_input_fn,
         )
 
 
@@ -186,6 +171,17 @@ class ExpertParallel(ParallelStyle):
 # This class is for dp2ep with TP (without TP we can just use ExpertParallel)
 class ExpertTensorParallel(ExpertParallel):
     def _token_dispatch(self, mod, inputs, device_mesh):
+        routed_input, num_tokens_per_expert = inputs
+
+        # NOTE: Currently in MoE TP, experts multiplication runs in plain Tensors.
+        #       The grad_placements on inputs is set to Partial so that necessary
+        #       reductions are performed during backward.
+        routed_input = DTensor.from_local(
+            routed_input, device_mesh["tp"], (Replicate(),)
+        ).to_local(grad_placements=(Partial(),))
+
+        inputs = (routed_input, num_tokens_per_expert)
+
         # token dispatch happens on the EP mesh, whereas device_mesh is [ep, tp] mesh
         return super()._token_dispatch(mod, inputs, device_mesh["ep"])
 
@@ -222,78 +218,16 @@ class ExpertTensorParallel(ExpertParallel):
         )
 
 
-def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
-    # TODO: move to core
-    from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
-
-    global TOKEN_GROUP_ALIGN_SIZE_M
-    x_padded_per_expert = x.shape[0] + num_local_experts * TOKEN_GROUP_ALIGN_SIZE_M
-    padded_max_len = _round_up(x_padded_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
-    with torch.no_grad():
-        (permuted_indices, num_tokens_per_expert, _offsets,) = generate_permute_indices(
-            num_tokens_per_expert,
-            num_local_experts,
-            ep_degree,
-            padded_max_len,
-            TOKEN_GROUP_ALIGN_SIZE_M,
-        )
-
-    x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
-    input_shape = x.shape
-    x = x[permuted_indices, :]
-
-    return input_shape, x, permuted_indices, num_tokens_per_expert
-
-
-def _unpermute(out, input_shape, permuted_indices):
-    out_unpermuted = out.new_empty(input_shape)
-    out_unpermuted[permuted_indices, :] = out
-    out = out_unpermuted[:-1]
-    return out
-
-
-def indices_padding_wrapper(func: Callable) -> Callable:
-    """
-    In order to use torch._grouped_mm, we need to make sure the number of
-    tokens each expert gets is a multiple of TOKEN_GROUP_ALIGN_SIZE_M. The
-    generate_permute_indices kernel also helps achieve this via padding,
-    without incurring synchronization between device and host.
-    """
-
-    def wrapper(
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        w3: torch.Tensor,
-        x: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
-    ) -> torch.Tensor:
-        num_local_experts = w1.shape[0]
-        ep_degree = num_tokens_per_expert.shape[0] // num_local_experts
-
-        input_shape, x, permuted_indices, num_tokens_per_expert = _permute(
-            x, num_tokens_per_expert, ep_degree, num_local_experts
-        )
-
-        out = func(w1, w2, w3, x, num_tokens_per_expert)
-
-        out = _unpermute(out, input_shape, permuted_indices)
-
-        return out
-
-    return wrapper
-
-
 # This class is to support Sequence Parallel for ETP=1
 # when EP borrows from all TP and part of DP
 class ReordererSequenceParallel(ParallelStyle):
     def __init__(self):
         super().__init__()
-        self.top_k = None
 
     def _prepare_inputput_fn(self, mod, inputs, device_mesh):
         # shape (batch_size*seq_len, top_k)
         top_scores, selected_experts_indices = inputs
-        num_tokens, self.top_k = top_scores.shape
+        num_tokens, _ = top_scores.shape
 
         # NOTE: If needed, we can pad tokens in case bs*slen is not divisible by TP degree
         # if top_scores.shape[0] % device_mesh.size() != 0:
@@ -330,8 +264,12 @@ class ReordererSequenceParallel(ParallelStyle):
         # NOTE: As we shard routed tokens along bs*slen dim across the TP ranks,
         #       the MoE gather and scatter still require global token indices.
         local_rank = device_mesh.get_local_rank()
-        # fact: top_scores.shape[0] // self.top_k = batch_size * seq_len // ep_degree
-        token_indices_experts_sorted += top_scores.shape[0] // self.top_k * local_rank
+        # fact: top_scores.shape[0] // mod.top_k = batch_size * seq_len // ep_degree
+        if not hasattr(mod, "top_k"):
+            raise ValueError(
+                "TokenReorderer class in MoE should always have top_k attribute."
+            )
+        token_indices_experts_sorted += top_scores.shape[0] // mod.top_k * local_rank
 
         return top_scores, token_indices_experts_sorted, num_tokens_per_expert
 

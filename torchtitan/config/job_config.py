@@ -19,8 +19,14 @@ class Job:
     description: str = "default job"
     """Description of the job"""
 
-    print_args: bool = False
-    """Print the args to terminal"""
+    print_config: bool = False
+    """Print the configs to terminal"""
+
+    custom_config_module: str = ""
+    """
+    This option allows users to extend the existing JobConfig with a customized
+    JobConfig dataclass. Users need to ensure that the path can be imported.
+    """
 
 
 @dataclass
@@ -314,18 +320,6 @@ class Parallelism:
     Pipeline Parallelism degree, or number of ranks. 1 means disabled.
     If using looped schedules, this still specifies the number of physical ranks, not the number
     of stages. Stages per rank are inferred from split points degree, and schedule.
-    """
-
-    pipeline_parallel_split_points: list[str] = field(default_factory=list)
-    """
-    DEPRECATED: Use module_fqns_per_model_part instead.
-    Specify comma-separated names of modules to use as the beginning of a split point.
-    e.g. "layers.0,layers.2" will cause the model to be split into 3 stages,
-    the first containing all the layers up to layers.0,
-    the second containing layers.0 and up to layers.2,
-    the third containing layers.2 and all the remaining layers.
-    Note: fully-automated splitting may be enabled in the future,
-    but currently the split points must be specified manually.
     """
 
     module_fqns_per_model_part: list[list[str]] | None = None
@@ -846,6 +840,8 @@ class Experimental:
 
     custom_args_module: str = ""
     """
+    DEPRECATED (moved to Job.custom_config_module). Will be removed soon.
+
     This option allows users to extend TorchTitan's existing JobConfig by extending
     a user defined JobConfig dataclass. Similar to ``--experimental.custom_model_path``, the user
     needs to ensure that the path can be imported.
