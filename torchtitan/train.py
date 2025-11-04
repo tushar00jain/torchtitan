@@ -13,6 +13,7 @@ from datetime import timedelta
 from typing import Any, Generator, Iterable, Optional
 
 import torch
+
 from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.protocols.train_spec as train_spec_module
@@ -134,8 +135,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         dist_utils.set_determinism(
             world_mesh,
             self.device,
-            job_config.training.seed,
-            job_config.training.deterministic,
+            job_config.debug,
+            distinct_seed_mesh_dims=["pp"],
         )
         self.train_spec = train_spec_module.get_train_spec(job_config.model.name)
 
