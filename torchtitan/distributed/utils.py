@@ -259,7 +259,10 @@ def maybe_enable_amp(
 
 
 def init_distributed(
-    comm_config: CommConfig, enable_cpu_backend: bool = False, base_folder: str = ""
+    comm_config: CommConfig,
+    enable_cpu_backend: bool = False,
+    base_folder: str = "",
+    ranks: list[int] | None = None,
 ):
     def _warn_overwrite_env(env, val):
         if env in os.environ:
@@ -303,6 +306,7 @@ def init_distributed(
     torch.distributed.init_process_group(
         backend=_get_distributed_backend(enable_cpu_backend),
         timeout=timedelta(seconds=comm_config.init_timeout_seconds),
+        _ranks=ranks if ranks is not None else [],
     )
 
 
@@ -453,9 +457,7 @@ def _clip_grad_norm_with_ep(
     if math.isinf(norm_type):
         total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
     else:
-        total_norm = (
-            ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
-        )
+        total_norm = ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
         total_norm **= 1.0 / norm_type
 
     if pp_mesh is not None:
