@@ -263,8 +263,12 @@ class PolicyTrainer(Actor, Configurable):
 
         from torchtitan.models.common.attention import VarlenAttention
 
+        attention_config = model_spec.model.first_attention
+        assert attention_config is not None, (
+            "The trainer model requires at least one attention layer"
+        )
         assert isinstance(
-            model_spec.model.layers[0].attention.inner_attention,
+            attention_config.inner_attention,
             (VarlenAttention.Config, FlexAttention.Config),
         ), "Only varlen and flex attention backends are allowed."
 

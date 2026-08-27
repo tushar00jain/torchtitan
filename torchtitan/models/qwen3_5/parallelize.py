@@ -43,6 +43,7 @@ def parallelize_qwen3_5(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ):
     """
     Apply tensor parallelism, activation checkpointing, torch.compile, and data
@@ -90,6 +91,12 @@ def parallelize_qwen3_5(
                 compile_config=compile_config,
                 parallel_dims=parallel_dims,
             )
+
+    # vLLM inference uses the model's tensor-parallel layout but cannot run
+    # through FSDP forward hooks under torch.inference_mode(). This matches the
+    # inference contract used by the other TitanRL-supported model families.
+    if skip_dp:
+        return model
 
     if parallelism.spmd_backend == "spmd_types":
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)

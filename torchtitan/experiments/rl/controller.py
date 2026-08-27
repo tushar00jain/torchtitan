@@ -650,6 +650,12 @@ class Controller(Configurable):
                     max_num_seqs=max_num_seqs,
                     output_dir=config.dump_folder,
                     direct_rdma=config.weight_sync.direct_rdma,
+                    collect_weight_sync_metrics=(
+                        config.weight_sync.enable_latency_metrics
+                    ),
+                    synchronize_cuda_for_weight_sync_metrics=(
+                        config.weight_sync.synchronize_cuda_for_latency_metrics
+                    ),
                 )
                 generators.append(generator)
             self.generator_router = router_mesh.spawn(
