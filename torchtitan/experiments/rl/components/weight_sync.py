@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Literal, TYPE_CHECKING
+from typing import Literal, Mapping, TYPE_CHECKING
 
 from torchstore.transport import TransportType
 
@@ -52,6 +52,16 @@ class WeightSyncConfig(Configurable.Config):
 
     direct_rdma_backend: Literal["monarch", "rdma4py", "torchcomms"] = "monarch"
     """Direct GPU RDMA data plane selected on the TorchStore strategy."""
+
+    enable_latency_metrics: bool = False
+    """Collect detailed generator and TorchStore weight-sync latency metrics."""
+
+    synchronize_cuda_for_latency_metrics: bool = False
+    """Synchronize CUDA at measured phase boundaries for accurate timings.
+
+    This makes the phase split easier to interpret, but can perturb overlap, so
+    it is intended for focused diagnostic experiments rather than normal runs.
+    """
 
     def __post_init__(self) -> None:
         if not self.direct_rdma and self.direct_rdma_backend != "monarch":
@@ -119,6 +129,7 @@ class WeightSyncManager:
         # Wall time of the push and pull of the last completed sync.
         self._last_push_s: float = 0.0
         self._last_pull_s: float = 0.0
+        self._last_pull_metrics: dict[str, float] = {}
 
     def start_async_push_pull(self, *, version: int) -> None:
         """Fire push -> pull -> buffer-slot release in the background; returns immediately.
@@ -143,12 +154,30 @@ class WeightSyncManager:
 
     async def wait_prev_pull(self) -> list[m.Metric]:
         await self._generator_pull_task
-        return [
+        metrics = [
             m.Metric(
                 "timing/weight_sync/generator_pull_model_state_dict",
                 m.NoReduce(self._last_pull_s),
             )
         ]
+        metrics.extend(
+            m.Metric(f"timing/weight_sync/{key}", m.NoReduce(value))
+            for key, value in self._last_pull_metrics.items()
+        )
+        generator_total = self._last_pull_metrics.get("generator/total/seconds/max")
+        if generator_total is not None:
+            queue_wait = self._last_pull_metrics.get(
+                "generator/queue_wait/seconds/max", 0.0
+            )
+            metrics.append(
+                m.Metric(
+                    "timing/weight_sync/controller_router_overhead/seconds",
+                    m.NoReduce(
+                        max(0.0, self._last_pull_s - generator_total - queue_wait)
+                    ),
+                )
+            )
+        return metrics
 
     async def wait_inflight_push_pull(self) -> None:
         """Finish the last in-flight push+pull so generators hold the final weights (e.g. before validation)."""
@@ -167,8 +196,13 @@ class WeightSyncManager:
         await push_task
         with sl.log_trace_span("generator_pull_model_state_dict"):
             start = time.perf_counter()
-            await self._generator_router.pull_model_state_dict.call_one(version)
+            details = await self._generator_router.pull_model_state_dict.call_one(
+                version
+            )
             self._last_pull_s = time.perf_counter() - start
+            self._last_pull_metrics = (
+                dict(details) if isinstance(details, Mapping) else {}
+            )
         # TODO(perf): pull_model_state_dict awaits ALL generators before we release any buffer slots,
         #   so a generator that finishes its pull early idles until the slowest one. Investigate
         #   per-generator release (router surfaces each pull's completion -> release that generator's

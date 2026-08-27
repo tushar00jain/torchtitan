@@ -49,9 +49,12 @@ class _Actor:
         wait_generate: bool = False,
         wait_pull: bool = False,
         raises_pull: bool = False,
+        pull_metrics: dict[str, float] | None = None,
     ):
         self.generate = _Endpoint(name, wait=wait_generate)
-        self.pull_model_state_dict = _Endpoint(None, wait=wait_pull, raises=raises_pull)
+        self.pull_model_state_dict = _Endpoint(
+            pull_metrics, wait=wait_pull, raises=raises_pull
+        )
 
     def flatten(self, *args, **kwargs):
         return self
@@ -358,6 +361,36 @@ def test_drain_excludes_syncing_generator_from_routes():
             [((1,), {})],
             [((1,), {})],
         ]
+
+    asyncio.run(_run())
+
+
+def test_pull_combines_diagnostic_metrics_across_generators():
+    async def _run():
+        actors = [
+            _Actor(
+                "gen0",
+                pull_metrics={
+                    "generator/total/seconds/max": 3.0,
+                    "generator/total/seconds/mean": 2.0,
+                },
+            ),
+            _Actor(
+                "gen1",
+                pull_metrics={
+                    "generator/total/seconds/max": 5.0,
+                    "generator/total/seconds/mean": 4.0,
+                },
+            ),
+        ]
+        metrics = await _router(actors, hot_swap=True)._pull_model_state_dict(
+            policy_version=1
+        )
+
+        assert metrics == {
+            "generator/total/seconds/max": 5.0,
+            "generator/total/seconds/mean": 3.0,
+        }
 
     asyncio.run(_run())
 
