@@ -22,6 +22,7 @@ from torchtitan.experiments.rl.actors.generator import (
     ModelStateDictPullRequest,
     RequestDispatcher,
     SamplingConfig,
+    summarize_weight_sync_observations,
     VLLMGenerator,
 )
 from torchtitan.experiments.rl.routing.intra_generator_router import (
@@ -105,6 +106,28 @@ def test_pull_takes_precedence_over_queued_requests() -> None:
     assert generator._queued_generation_requests == [
         request
     ]  # NOT consumed — pull runs first
+
+
+def test_weight_sync_observations_are_reduced_for_graphing() -> None:
+    summary = summarize_weight_sync_observations(
+        [
+            {
+                "generator/torchstore_get/seconds": [2.0],
+                "torchstore/rdma4py/registration_cache_hit": [1.0, 1.0],
+                "torchstore/rdma4py/registration_cache_miss": [1.0],
+            },
+            {
+                "generator/torchstore_get/seconds": [4.0],
+                "torchstore/rdma4py/registration_cache_hit": [1.0],
+                "torchstore/rdma4py/registration_cache_miss": [1.0],
+            },
+        ]
+    )
+
+    assert summary["generator/torchstore_get/seconds/mean"] == 3.0
+    assert summary["generator/torchstore_get/seconds/max"] == 4.0
+    assert summary["torchstore/rdma4py/registration_cache_hit/sum"] == 3.0
+    assert summary["torchstore/rdma4py/registration_cache_hit_rate"] == 0.6
 
 
 def test_step_drains_the_queue() -> None:
