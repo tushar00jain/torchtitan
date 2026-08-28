@@ -46,6 +46,10 @@ class _TrainerActorEndpoints:
     async def push_model_state_dict(self) -> None:
         await super().push_model_state_dict()
 
+    @concurrent_endpoint
+    async def attach_weight_sync(self) -> None:
+        await super().attach_weight_sync()
+
 
 class TrainerActor(Actor, _TrainerActorEndpoints, Trainer):
     """Expose a standalone :class:`Trainer` through Monarch endpoints."""
