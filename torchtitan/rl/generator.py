@@ -741,6 +741,9 @@ class VLLMGenerator(Configurable):
         (prefill + decode, summed over the batch). ``None`` (default) leaves
         vLLM's own engine default in place."""
 
+        flex_attention_kv_block_size: int | None = None
+        """Logical KV block size passed to vLLM's FlexAttention backend."""
+
         cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
         """CUDA graph capture settings for the vLLM engine."""
 
@@ -826,6 +829,7 @@ class VLLMGenerator(Configurable):
         rank: int | None = None,
         generator_name: str = "generator",
         open_result_channel: Callable[[], tuple[Any, Any]] | None = None,
+        replica_idx: int = 0,
     ):
         init_logger()
         # TODO: Quiet torchstore's per-op transport-resolve INFO spam (very noisy in CI).
@@ -840,6 +844,9 @@ class VLLMGenerator(Configurable):
 
         self.config = config
         self.model_spec = model_spec
+        # Index of this generator's mesh, matching its position in the
+        # relay meshes TorchStore is initialized with.
+        self._replica_idx = replica_idx
 
         self._max_num_seqs = max_num_seqs
 
@@ -919,6 +926,7 @@ class VLLMGenerator(Configurable):
                     if isinstance(attention_backend, FlexInnerAttention.Config)
                     else AttentionBackendEnum.CUSTOM
                 ),
+                flex_attn_kv_block_size=config.flex_attention_kv_block_size,
             ),
             # Enables RequestOutput.metrics, so generator metrics can be returned
             disable_log_stats=False,
@@ -1343,11 +1351,24 @@ class VLLMGenerator(Configurable):
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
         await pull_model_state_dict_future
 
+    async def attach_weight_sync(self) -> None:
+        """Hand this generator's state dict to TorchStore to plan its routes.
+
+        Returns once every participant has registered and this rank's routes are
+        installed. Only tensor geometry is exchanged, no weights.
+        """
+        model = self._get_model()
+        state_dict = model.model.state_dict()
+        state_dict = self._to_spmd_state_dict(state_dict, model=model)
+        store = await ts.client(role="requester", group=self._replica_idx)
+        await store.register_state_dict_locally(state_dict, "model_state_dict")
+
     @sl.log_trace_span("pull_model_state_dict_copy")
     async def _pull_model_state_dict(self, version: int) -> None:
         """ALL RANKS: collectively copy the latest weights from TorchStore, optionally drop the
         prefix cache (so no new request reuses an old-weight prefix), and bump the policy version.
         """
+
         # Async RL uses a StorageVolume snapshot so generators do not read
         # live trainer GPU tensors while optimizer steps may be mutating them.
         model = self._get_model()
@@ -1376,6 +1397,17 @@ class VLLMGenerator(Configurable):
             self._pull_model_state_dict_future = None
             self._model_state_dict_pull_request = None
 
+    def _to_spmd_state_dict(self, model_sd: dict, *, model) -> dict:
+        """Wrap generator-local tensors with their requested DTensor layouts."""
+
+        dtensor_model_sd = plain_tensor_to_dtensor_state_dict(
+            model_sd,
+            state_dict_layouts=model.get_state_dict_layouts(),
+            parallel_dims=model.parallel_dims,
+        )
+
+        return dtensor_model_sd
+
     async def _get_spmd_state_dict(self, model_sd: dict, *, model) -> None:
         """Fetch trainer-pushed weights into a spmd_types generator state dict.
 
@@ -1385,11 +1417,7 @@ class VLLMGenerator(Configurable):
         state-dict path, then put the local tensors back before load_state_dict.
         """
 
-        dtensor_model_sd = plain_tensor_to_dtensor_state_dict(
-            model_sd,
-            state_dict_layouts=model.get_state_dict_layouts(),
-            parallel_dims=model.parallel_dims,
-        )
+        dtensor_model_sd = self._to_spmd_state_dict(model_sd, model=model)
 
         await ts.get_state_dict(
             "model_state_dict",

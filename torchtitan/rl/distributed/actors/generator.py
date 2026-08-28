@@ -26,6 +26,7 @@ class _GeneratorActorEndpoints:
         compile_config: CompileConfig | None,
         max_num_seqs: int,
         output_dir: str,
+        replica_idx: int = 0,
     ) -> None:
         super().__init__(
             config,
@@ -37,6 +38,7 @@ class _GeneratorActorEndpoints:
             rank=current_rank().rank,
             generator_name=context().actor_instance.actor_id.actor_name,
             open_result_channel=Channel.open,
+            replica_idx=replica_idx,
         )
 
     @concurrent_endpoint
@@ -68,6 +70,10 @@ class _GeneratorActorEndpoints:
     @concurrent_endpoint
     async def pull_model_state_dict(self, version: int) -> None:
         await super().pull_model_state_dict(version)
+
+    @concurrent_endpoint
+    async def attach_weight_sync(self) -> None:
+        await super().attach_weight_sync()
 
     @concurrent_endpoint
     async def close(self) -> None:
