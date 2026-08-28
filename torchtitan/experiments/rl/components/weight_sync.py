@@ -11,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Literal, Mapping, TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, Literal, Mapping
 
+import tyro
 from torchstore.transport import TransportType
 
 from torchtitan.config import Configurable
@@ -47,6 +48,9 @@ DIRECT_WEIGHT_SYNC_TRANSPORT_TYPES: dict[str, TransportType] = {
 class WeightSyncConfig(Configurable.Config):
     """TorchStore policy-weight synchronization settings."""
 
+    mode: Annotated[Literal["current", "routing"], tyro.conf.Suppress] = "current"
+    """Use controller lookups or a precomputed local routing plan."""
+
     direct_rdma: bool = False
     """Transfer directly from trainer GPUs instead of staging in StorageVolumes."""
 
@@ -64,6 +68,14 @@ class WeightSyncConfig(Configurable.Config):
     """
 
     def __post_init__(self) -> None:
+        if self.mode not in ("current", "routing"):
+            raise ValueError(
+                f"Unknown weight_sync.mode {self.mode!r}; expected 'current' or 'routing'"
+            )
+        if self.mode == "routing" and self.direct_rdma:
+            raise ValueError(
+                "weight_sync.mode='routing' does not support direct_rdma"
+            )
         if not self.direct_rdma and self.direct_rdma_backend != "monarch":
             raise ValueError(
                 "weight_sync.direct_rdma_backend requires "
