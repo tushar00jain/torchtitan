@@ -96,6 +96,7 @@ class PolicyTrainer(Actor, Configurable):
         hf_assets_path: str = "",
         generator_dtype: str = "",
         output_dir: str,
+        direct_rdma: bool = False,
     ):
         init_logger()
         # Quiet torchstore's per-op transport-resolve INFO spam (very noisy in CI).
@@ -120,6 +121,7 @@ class PolicyTrainer(Actor, Configurable):
         training_dtype = TORCH_DTYPE_MAP[config.training.dtype]
         gen_dtype = TORCH_DTYPE_MAP[generator_dtype] if generator_dtype else None
         self._transfer_dtype = gen_dtype if gen_dtype != training_dtype else None
+        self._direct_rdma = direct_rdma
 
         # Device setup
         device_module, device_type = utils.device_module, utils.device_type
@@ -490,13 +492,9 @@ class PolicyTrainer(Actor, Configurable):
     @concurrent_endpoint
     @sl.log_trace_span("push_model_state_dict")
     async def push_model_state_dict(self) -> None:
-        """Stage model weights to a CPU StorageVolume for the generators to pull (TorchStore).
-
-        `direct_rdma=False` copies the state dict GPU->CPU, so the trainer's GPU weights are free once
-        this returns and any number of generators can read the staged copy.
-        """
+        """Publish model weights through the configured TorchStore sync path."""
         state_dict = self.model.state_dict()
-        if self._transfer_dtype is not None:
+        if self._transfer_dtype is not None and not self._direct_rdma:
             # torchstore only applies `transfer_dtype` on the RDMA path, so under direct_rdma=False
             # cast to the generator dtype here (else the generator reads fp32 into its bf16 state dict).
             # Exclude buffers from the cast: FSDP mixed precision casts params to the compute dtype but
@@ -520,5 +518,6 @@ class PolicyTrainer(Actor, Configurable):
         await ts.put_state_dict(
             state_dict,
             "model_state_dict",
-            direct_rdma=False,
+            direct_rdma=self._direct_rdma,
+            transfer_dtype=self._transfer_dtype if self._direct_rdma else None,
         )
