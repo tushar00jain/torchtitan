@@ -12,6 +12,8 @@ import asyncio
 import time
 from typing import TYPE_CHECKING
 
+from torchstore.transport import TransportType
+
 from torchtitan.experiments.rl.components.work_buffer import RolloutGroupWorkBuffer
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.observability import structured_logger as sl
@@ -21,6 +23,22 @@ if TYPE_CHECKING:
     from torchtitan.experiments.rl.routing.inter_generator_router import (
         InterGeneratorRouter,
     )
+
+
+WEIGHT_SYNC_TRANSPORT_TYPES: dict[str, TransportType] = {
+    "auto": TransportType.Unset,
+    "gloo": TransportType.Gloo,
+    "monarch_rdma": TransportType.MonarchRDMA,
+    "monarch_rpc": TransportType.MonarchRPC,
+    "torchcomms": TransportType.TorchComms,
+}
+
+def resolve_weight_sync_transport_type(
+    staged_transport: str,
+) -> TransportType:
+    """Resolve the configured staged TorchStore transport."""
+    return WEIGHT_SYNC_TRANSPORT_TYPES[staged_transport]
+
 
 # dummy no-op for step 0, used in WeightSyncManager
 async def _noop() -> None:

@@ -12,6 +12,9 @@ Each function returns a complete ``Controller.Config``, discoverable by
 """
 
 import dataclasses
+from functools import partial
+
+import torch.nn as nn
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper
@@ -190,6 +193,19 @@ def rl_grpo_qwen3_0_6b_flex() -> Controller.Config:
     )
 
 
+def rl_grpo_qwen3_debug_flex() -> Controller.Config:
+    """Random-init Qwen3 debug model for local, checkpoint-free RL runs."""
+    config = rl_grpo_qwen3_0_6b_flex()
+    config.model_spec = _qwen3_rl_model_registry(
+        "debugmodel", attn_backend="flex"
+    )
+    config.model_spec.model.tok_embeddings.param_init = {
+        "weight": partial(nn.init.normal_, std=0.02)
+    }
+    config.hf_assets_path = "tests/assets/tokenizer"
+    return config
+
+
 def rl_grpo_qwen3_0_6b_flex_batch_invariant() -> Controller.Config:
     """GRPO training config for Qwen3-0.6B with flex attention and batch invariance
     for bitwise-identical numerics between trainer and generator (4 GPUs: 2 gen + 2 train).
@@ -345,6 +361,13 @@ def rl_grpo_gpt_oss_debug_varlen() -> Controller.Config:
             ),
         ),
     )
+
+
+def rl_grpo_gpt_oss_debug_flex() -> Controller.Config:
+    """Small GPT-OSS debug config using PyTorch FlexAttention."""
+    config = rl_grpo_gpt_oss_debug_varlen()
+    config.model_spec = gpt_oss_model_registry("debugmodel", attn_backend="flex")
+    return config
 
 
 def rl_grpo_gpt_oss_debug_varlen_batch_invariant() -> Controller.Config:

@@ -275,9 +275,14 @@ def spawn_proc_mesh(
     return trainer_mesh, generator_meshes
 
 
-async def main():
-    config = ConfigManager().parse_args()
-    assert isinstance(config, Controller.Config)
+async def run(
+    config: Controller.Config,
+    *,
+    trainer_world_size: int,
+    per_generator_world_size: int,
+    host_meshes: HostMeshes | None,
+) -> None:
+    """Run RL training on local or caller-provided trainer/generator hosts."""
     sl.init_structured_logger(
         source="rl_controller",
         output_dir=config.dump_folder,
@@ -288,14 +293,10 @@ async def main():
 
     rl_trainer: Controller = config.build()
     try:
-        trainer_world_size = _compute_trainer_world_size(config.trainer.parallelism)
-        per_generator_world_size = _compute_generator_world_size(
-            config.generator.parallelism
-        )
         trainer_mesh, generator_meshes = spawn_proc_mesh(
             trainer_world_size,
             per_generator_world_size,
-            host_meshes=None,
+            host_meshes=host_meshes,
             num_generators=config.num_generators,
             generator_env=breakable_cudagraph_env(config.generator),
         )
@@ -308,6 +309,21 @@ async def main():
         logger.info("Interrupted; attempting graceful shutdown...")
     finally:
         await rl_trainer.close()
+
+
+async def main():
+    config = ConfigManager().parse_args()
+    assert isinstance(config, Controller.Config)
+    trainer_world_size = _compute_trainer_world_size(config.trainer.parallelism)
+    per_generator_world_size = _compute_generator_world_size(
+        config.generator.parallelism
+    )
+    await run(
+        config,
+        trainer_world_size=trainer_world_size,
+        per_generator_world_size=per_generator_world_size,
+        host_meshes=None,
+    )
 
 
 if __name__ == "__main__":
