@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import json
 import random
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NamedTuple
 
 from datasets import load_dataset
@@ -169,7 +171,12 @@ def _load_authors(hf_dataset: str, hf_split: str) -> tuple[_Author, ...]:
         "Marc Chardin"  -> _Author("MarcChardin", "marc", "chardin")
         "Yan Hong Yao"  -> skipped (not exactly two space-separated parts)
     """
-    dataset = load_dataset(hf_dataset, split=hf_split)
+    dataset_path = Path(hf_dataset).expanduser()
+    if dataset_path.is_file():
+        with dataset_path.open() as source:
+            dataset = [json.loads(line) for line in source if line.strip()]
+    else:
+        dataset = load_dataset(hf_dataset, split=hf_split)
     seen: set[str] = set()
     authors: list[_Author] = []
     for row in dataset:

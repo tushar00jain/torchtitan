@@ -15,10 +15,30 @@ trainer actor, generator router, and group buffer (no GPU / Monarch / TorchStore
 import asyncio
 import contextlib
 
-from torchtitan.experiments.rl.components.weight_sync import WeightSyncManager
+import pytest
+from torchstore.transport import TransportType
+
+from torchtitan.experiments.rl.components.weight_sync import (
+    resolve_weight_sync_transport_type,
+    WeightSyncManager,
+)
 
 TRAINER_PUSH_KEY = "timing/weight_sync/trainer_push_model_state_dict"
 GENERATOR_PULL_KEY = "timing/weight_sync/generator_pull_model_state_dict"
+
+
+@pytest.mark.parametrize(
+    ("transport", "expected"),
+    [
+        ("auto", TransportType.Unset),
+        ("gloo", TransportType.Gloo),
+        ("monarch_rdma", TransportType.MonarchRDMA),
+        ("monarch_rpc", TransportType.MonarchRPC),
+        ("torchcomms", TransportType.TorchComms),
+    ],
+)
+def test_staged_backend_selects_strategy_transport(transport, expected) -> None:
+    assert resolve_weight_sync_transport_type(transport) == expected
 
 
 class _Endpoint:
