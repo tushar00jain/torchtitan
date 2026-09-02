@@ -196,7 +196,9 @@ class VLLMModelWrapper(Module):
 
         # Replace inner_attention with VLLMAttentionWrapper in config
         model_config = model_spec.model
-        attn_config = model_config.layers[0].attention
+        attn_config = model_config.first_attention
+        if attn_config is None:
+            raise ValueError("The vLLM model requires at least one attention layer")
         n_heads = attn_config.n_heads
         n_kv_heads = attn_config.n_kv_heads or n_heads
         head_dim = (
@@ -206,6 +208,9 @@ class VLLMModelWrapper(Module):
         )
         new_layers = []
         for layer_cfg in model_config.layers:
+            if layer_cfg.attention is None:
+                new_layers.append(layer_cfg)
+                continue
             vllm_backend = VLLMAttentionWrapper.Config(
                 hidden_size=model_config.dim,
                 num_heads=n_heads,

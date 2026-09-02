@@ -94,7 +94,7 @@ class _PullEndpoint:
 
     async def call_one(self, policy_version):
         self._router.pulled_versions.append(policy_version)
-        await self._router._on_pull()
+        return await self._router._on_pull()
 
 
 class _FakeBuffer:
@@ -216,6 +216,34 @@ def test_wait_before_first_start_returns_zero_metrics() -> None:
         assert push_metrics[0].key == TRAINER_PUSH_KEY
         assert push_metrics[0].value.value == 0.0
         assert pull_metrics[0].value.value == 0.0
+
+    asyncio.run(run())
+
+
+def test_pull_exposes_nested_latency_metrics() -> None:
+    async def run() -> None:
+        async def on_pull():
+            return {
+                "generator/total/seconds/max": 2.0,
+                "generator/queue_wait/seconds/max": 0.25,
+                "generator/torchstore_get/seconds/max": 1.5,
+            }
+
+        wsm = _manager(
+            trainer=_FakeTrainer(_noop),
+            router=_FakeRouter(on_pull),
+            buffer=_FakeBuffer(),
+        )
+        wsm.start_async_push_pull(version=1)
+        metrics = await wsm.wait_prev_pull()
+        values = {metric.key: metric.value.value for metric in metrics}
+
+        assert values[
+            "timing/weight_sync/generator/torchstore_get/seconds/max"
+        ] == 1.5
+        assert values[
+            "timing/weight_sync/controller_router_overhead/seconds"
+        ] >= 0.0
 
     asyncio.run(run())
 

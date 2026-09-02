@@ -12,6 +12,9 @@ import gc
 import logging
 import math
 import os
+import re
+import statistics
+import time
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -67,6 +70,46 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 logger = logging.getLogger(__name__)
 
 # TODO(async-rl): this file is large. Split a backend-agnostic BaseGenerator.
+
+
+def _metric_key(value: str) -> str:
+    """Make a TorchStore tracker key safe and readable as a metric path."""
+
+    value = value.replace("[", "/").replace("]", "")
+    return re.sub(r"[^a-zA-Z0-9_./-]+", "_", value).strip("/")
+
+
+def summarize_weight_sync_observations(
+    observations_by_rank: list[dict[str, list[float]]],
+) -> dict[str, float]:
+    """Reduce per-rank diagnostic observations into graph-ready mean/max values."""
+
+    combined: dict[str, list[float]] = {}
+    for observations in observations_by_rank:
+        for key, values in observations.items():
+            combined.setdefault(_metric_key(key), []).extend(values)
+
+    summary: dict[str, float] = {}
+    for key, values in combined.items():
+        if not values:
+            continue
+        summary[f"{key}/mean"] = statistics.fmean(values)
+        summary[f"{key}/max"] = max(values)
+        if key.endswith(("registration_cache_hit", "registration_cache_miss")):
+            summary[f"{key}/sum"] = sum(values)
+        if key.endswith("register_tensor/seconds"):
+            summary[f"{key}/sum"] = sum(values)
+
+    for backend in ("rdma4py", "torchcomms", "torchcomms_rdma"):
+        hits = sum(combined.get(f"torchstore/{backend}/registration_cache_hit", []))
+        misses = sum(
+            combined.get(f"torchstore/{backend}/registration_cache_miss", [])
+        )
+        if hits + misses:
+            summary[
+                f"torchstore/{backend}/registration_cache_hit_rate"
+            ] = hits / (hits + misses)
+    return summary
 
 
 @dataclass(kw_only=True, slots=True)
@@ -818,6 +861,8 @@ class VLLMGenerator(Actor, Configurable):
         max_num_seqs: int,
         output_dir: str,
         direct_rdma: bool = False,
+        collect_weight_sync_metrics: bool = False,
+        synchronize_cuda_for_weight_sync_metrics: bool = False,
     ):
         init_logger()
         # Quiet torchstore's per-op transport-resolve INFO spam (very noisy in CI).
@@ -833,6 +878,10 @@ class VLLMGenerator(Actor, Configurable):
         self.config = config
         self.model_spec = model_spec
         self._direct_rdma = direct_rdma
+        self._collect_weight_sync_metrics = collect_weight_sync_metrics
+        self._synchronize_cuda_for_weight_sync_metrics = (
+            synchronize_cuda_for_weight_sync_metrics
+        )
 
         self._max_num_seqs = max_num_seqs
 
@@ -853,7 +902,10 @@ class VLLMGenerator(Actor, Configurable):
         )
 
         # Set vLLM environment variables from config before any vLLM initialization
-        inner_attn = model_spec.model.layers[0].attention.inner_attention
+        attention_config = model_spec.model.first_attention
+        if attention_config is None:
+            raise ValueError("The generator model requires at least one attention layer")
+        inner_attn = attention_config.inner_attention
         assert isinstance(
             inner_attn,
             (VarlenAttention.Config, FlexAttention.Config),
@@ -968,7 +1020,9 @@ class VLLMGenerator(Actor, Configurable):
         self._model_state_dict_pull_request: ModelStateDictPullRequest | None = None
         self._close_request: CloseRequest | None = None
 
-        self._pull_model_state_dict_future: asyncio.Future[int] | None = None
+        self._pull_model_state_dict_future: (
+            asyncio.Future[dict[str, float] | None] | None
+        ) = None
 
         # Background asyncio.Task running _engine_loop; None until start_engine_loop starts it.
         self._engine_loop_task: asyncio.Task | None = None
@@ -1128,7 +1182,10 @@ class VLLMGenerator(Actor, Configurable):
                     return
 
                 if decision.action is LoopAction.PULL_MODEL_STATE_DICT:
-                    await self._pull_model_state_dict(decision.pull_version)
+                    await self._pull_model_state_dict(
+                        decision.pull_version,
+                        queue_wait_s=decision.pull_queue_wait_s,
+                    )
                     continue  # back to the start for the next decision
 
                 if decision.action is LoopAction.STEP:
@@ -1202,10 +1259,15 @@ class VLLMGenerator(Actor, Configurable):
 
             # A weight pull takes priority over admitting new requests.
             if self._model_state_dict_pull_request is not None:
+                queue_wait_s = (
+                    time.perf_counter()
+                    - self._model_state_dict_pull_request.queued_at
+                )
                 return LoopDecision(
                     action=LoopAction.PULL_MODEL_STATE_DICT,
                     requests_per_dp_rank=[],
                     pull_version=self._model_state_dict_pull_request.version,
+                    pull_queue_wait_s=queue_wait_s,
                 )
 
             # STEP: admit whatever is queued (may be empty -> just keep stepping in-flight work).
@@ -1253,7 +1315,7 @@ class VLLMGenerator(Actor, Configurable):
 
     @concurrent_endpoint
     @sl.log_trace_span("pull_model_state_dict")
-    async def pull_model_state_dict(self, version: int) -> None:
+    async def pull_model_state_dict(self, version: int) -> dict[str, float] | None:
         """Queues a weight pull for `version` and blocks until the engine loop has finished pulling.
 
         NOTE: In-flight requests are NOT drained here — the endpoint never drains; a caller that wants
@@ -1269,30 +1331,69 @@ class VLLMGenerator(Actor, Configurable):
 
         # A placeholder future for the engine loop to resolve once the pull has been applied.
         pull_model_state_dict_future: asyncio.Future[
-            int
+            dict[str, float] | None
         ] = asyncio.get_running_loop().create_future()
 
         # `_engine_loop_condition` wakes the engine loop, if asleep, when a pull is queued.
         async with self._engine_loop_condition:
             self._model_state_dict_pull_request = ModelStateDictPullRequest(
-                version=version
+                version=version,
+                queued_at=time.perf_counter(),
             )
             self._pull_model_state_dict_future = pull_model_state_dict_future
             self._engine_loop_condition.notify()  # wakes the engine loop only if it is idle
 
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
-        await pull_model_state_dict_future
+        return await pull_model_state_dict_future
 
     @sl.log_trace_span("pull_model_state_dict_copy")
-    async def _pull_model_state_dict(self, version: int) -> None:
+    async def _pull_model_state_dict(
+        self, version: int, *, queue_wait_s: float = 0.0
+    ) -> None:
         """ALL RANKS: collectively copy the latest weights from TorchStore, optionally drop the
         prefix cache (so no new request reuses an old-weight prefix), and bump the policy version.
         """
         # Async RL uses a StorageVolume snapshot so generators do not read
         # live trainer GPU tensors while optimizer steps may be mutating them.
+        def synchronize_cuda() -> None:
+            if (
+                self._synchronize_cuda_for_weight_sync_metrics
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.synchronize()
+
+        collect_metrics = self._collect_weight_sync_metrics
+        observations: dict[str, list[float]] = {}
+        total_start = time.perf_counter()
+        synchronize_cuda()
+
+        phase_start = time.perf_counter()
         model = self._get_model()
         model_sd = model.model.state_dict()
-        if get_spmd_backend() == "spmd_types":
+        synchronize_cuda()
+        observations["generator/state_dict/seconds"] = [
+            time.perf_counter() - phase_start
+        ]
+
+        phase_start = time.perf_counter()
+        if collect_metrics:
+            with ts.collect_latencies() as collector:
+                if get_spmd_backend() == "spmd_types":
+                    await self._get_spmd_state_dict(model_sd, model=model)
+                else:
+                    await ts.get_state_dict(
+                        "model_state_dict",
+                        user_state_dict=model_sd,
+                        strict=False,
+                        direct_rdma=self._direct_rdma,
+                    )
+            observations.update(
+                {
+                    f"torchstore/{key}": values
+                    for key, values in collector.snapshot().items()
+                }
+            )
+        elif get_spmd_backend() == "spmd_types":
             await self._get_spmd_state_dict(model_sd, model=model)
         else:
             await ts.get_state_dict(
@@ -1301,14 +1402,23 @@ class VLLMGenerator(Actor, Configurable):
                 strict=False,
                 direct_rdma=self._direct_rdma,
             )
+        synchronize_cuda()
+        torchstore_get_s = time.perf_counter() - phase_start
+        observations["generator/torchstore_get/seconds"] = [torchstore_get_s]
         # state_dict() returns hook-produced copies for fused modules (e.g.
         # FusedQKVLinear's wqkv -> wq/wk/wv), so the in-place fill above never
         # reaches the real param. Re-apply via load_state_dict to run the merge hook.
         # Non-fused params share storage with model_sd, so reloading them is a
         # harmless self-copy; only the fused wqkv is actually rebuilt.
         # TODO: investigate can we avoid the copy and properly load fused qkv weights
+        phase_start = time.perf_counter()
         model.model.load_state_dict(model_sd, strict=False)
+        synchronize_cuda()
+        observations["generator/load_state_dict/seconds"] = [
+            time.perf_counter() - phase_start
+        ]
         self.policy_version = version
+        phase_start = time.perf_counter()
         if self.config.reset_prefix_cache_on_weight_sync:
             # TODO(async-rl): consider a `flush_kv_cache_every_n_steps` flag to force-flush every N steps
             #   (helps long generations that span many steps).
@@ -1317,12 +1427,40 @@ class VLLMGenerator(Actor, Configurable):
             self._engine.reset_prefix_cache(
                 reset_running_requests=self.config.reset_running_requests_on_weight_sync,
             )
+        synchronize_cuda()
+        observations["generator/prefix_cache_reset/seconds"] = [
+            time.perf_counter() - phase_start
+        ]
+        phase_start = time.perf_counter()
         gc.collect()
+        synchronize_cuda()
+        observations["generator/gc/seconds"] = [time.perf_counter() - phase_start]
+        total_s = time.perf_counter() - total_start
+        observations["generator/queue_wait/seconds"] = [queue_wait_s]
+        observations["generator/total/seconds"] = [total_s]
+        observations["generator/outside_torchstore/seconds"] = [
+            max(0.0, total_s - torchstore_get_s)
+        ]
+
+        metrics: dict[str, float] | None = None
+        if collect_metrics:
+            observations_by_rank: list[dict[str, list[float]] | None] = [
+                None
+            ] * dist.get_world_size(self._broadcast_group)
+            await asyncio.to_thread(
+                dist.all_gather_object,
+                observations_by_rank,
+                observations,
+                group=self._broadcast_group,
+            )
+            metrics = summarize_weight_sync_observations(
+                [item for item in observations_by_rank if item is not None]
+            )
 
         # Rank 0 holds the pull's future. Until this is resolved,
         # no new requests are admitted or processed.
         if self._rank == 0 and self._pull_model_state_dict_future is not None:
-            self._pull_model_state_dict_future.set_result(version)
+            self._pull_model_state_dict_future.set_result(metrics)
             self._pull_model_state_dict_future = None
             self._model_state_dict_pull_request = None
 
@@ -1489,6 +1627,7 @@ class ModelStateDictPullRequest:
     """A queued weight pull: the policy `version` to copy from TorchStore."""
 
     version: int
+    queued_at: float = field(default_factory=time.perf_counter)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -1537,3 +1676,6 @@ class LoopDecision:
 
     pull_version: int | None = None
     # set iff action is PULL_MODEL_STATE_DICT
+
+    pull_queue_wait_s: float = 0.0
+    # rank-0 time between enqueueing the pull and selecting it in the engine loop
