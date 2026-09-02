@@ -30,6 +30,7 @@ GENERATOR_PULL_KEY = "timing/weight_sync/generator_pull_model_state_dict"
 
 def test_weight_sync_config_preserves_defaults() -> None:
     config = WeightSyncConfig()
+    assert config.mode == "current"
     assert not config.direct_rdma
     assert config.direct_rdma_backend == "monarch"
 
@@ -44,6 +45,20 @@ def test_weight_sync_config_accepts_direct_backends(backend) -> None:
 def test_weight_sync_backend_requires_direct_rdma() -> None:
     with pytest.raises(ValueError, match="direct_rdma=True"):
         WeightSyncConfig(direct_rdma_backend="rdma4py")
+
+
+def test_routing_weight_sync_rejects_direct_rdma() -> None:
+    with pytest.raises(ValueError, match="does not support direct_rdma"):
+        WeightSyncConfig(mode="routing", direct_rdma=True)
+
+
+def test_routing_weight_sync_config() -> None:
+    assert WeightSyncConfig(mode="routing").mode == "routing"
+
+
+def test_weight_sync_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="Unknown weight_sync.mode"):
+        WeightSyncConfig(mode="unknown")
 
 
 @pytest.mark.parametrize(

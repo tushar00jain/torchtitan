@@ -860,6 +860,7 @@ class VLLMGenerator(Actor, Configurable):
         compile_config: CompileConfig,
         max_num_seqs: int,
         output_dir: str,
+        replica_idx: int = 0,
         direct_rdma: bool = False,
         collect_weight_sync_metrics: bool = False,
         synchronize_cuda_for_weight_sync_metrics: bool = False,
@@ -877,6 +878,9 @@ class VLLMGenerator(Actor, Configurable):
 
         self.config = config
         self.model_spec = model_spec
+        # Index of this generator's mesh, matching its position in the
+        # relay meshes TorchStore is initialized with.
+        self._replica_idx = replica_idx
         self._direct_rdma = direct_rdma
         self._collect_weight_sync_metrics = collect_weight_sync_metrics
         self._synchronize_cuda_for_weight_sync_metrics = (
@@ -1346,6 +1350,28 @@ class VLLMGenerator(Actor, Configurable):
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
         return await pull_model_state_dict_future
 
+    @concurrent_endpoint
+    async def attach_weight_sync(self) -> None:
+        """Hand this generator's state dict to TorchStore to plan its routes.
+
+        Returns once every participant has registered and this rank's routes are
+        installed. Only tensor geometry is exchanged, no weights.
+        """
+        model = self._get_model()
+        state_dict = model.model.state_dict()
+        if get_spmd_backend() == "spmd_types":
+            state_dict = self._to_spmd_state_dict(state_dict, model=model)
+        elif (
+            self.config.parallelism.tensor_parallel_degree > 1
+            or self.config.parallelism.expert_parallel_degree > 1
+        ) and not any(isinstance(value, DTensor) for value in state_dict.values()):
+            raise RuntimeError(
+                "routing weight sync cannot derive global TensorSlice geometry "
+                "from plain tensors in a sharded generator state dict"
+            )
+        store = await ts.client(role="requester", group=self._replica_idx)
+        await store.register_state_dict(state_dict, "model_state_dict")
+
     @sl.log_trace_span("pull_model_state_dict_copy")
     async def _pull_model_state_dict(
         self, version: int, *, queue_wait_s: float = 0.0
@@ -1353,6 +1379,7 @@ class VLLMGenerator(Actor, Configurable):
         """ALL RANKS: collectively copy the latest weights from TorchStore, optionally drop the
         prefix cache (so no new request reuses an old-weight prefix), and bump the policy version.
         """
+
         # Async RL uses a StorageVolume snapshot so generators do not read
         # live trainer GPU tensors while optimizer steps may be mutating them.
         def synchronize_cuda() -> None:
@@ -1464,14 +1491,8 @@ class VLLMGenerator(Actor, Configurable):
             self._pull_model_state_dict_future = None
             self._model_state_dict_pull_request = None
 
-    async def _get_spmd_state_dict(self, model_sd: dict, *, model) -> None:
-        """Fetch trainer-pushed weights into a spmd_types generator state dict.
-
-        spmd_types generators hold plain local tensors, but TorchStore already
-        knows how to fill DTensor state-dict entries. Wrap each local tensor as
-        a DTensor using its declared SPMD layout, fetch through the normal
-        state-dict path, then put the local tensors back before load_state_dict.
-        """
+    def _to_spmd_state_dict(self, model_sd: dict, *, model) -> dict:
+        """Wrap generator-local tensors with their requested DTensor layouts."""
 
         def _fqn_to_spmd_layout(model: torch.nn.Module) -> dict[str, SpmdLayout]:
             layouts: dict[str, SpmdLayout] = {}
@@ -1549,6 +1570,19 @@ class VLLMGenerator(Actor, Configurable):
                     resolve_placements(layout, mesh),
                     run_check=False,
                 )
+
+        return dtensor_model_sd
+
+    async def _get_spmd_state_dict(self, model_sd: dict, *, model) -> None:
+        """Fetch trainer-pushed weights into a spmd_types generator state dict.
+
+        spmd_types generators hold plain local tensors, but TorchStore already
+        knows how to fill DTensor state-dict entries. Wrap each local tensor as
+        a DTensor using its declared SPMD layout, fetch through the normal
+        state-dict path, then put the local tensors back before load_state_dict.
+        """
+
+        dtensor_model_sd = self._to_spmd_state_dict(model_sd, model=model)
 
         await ts.get_state_dict(
             "model_state_dict",
