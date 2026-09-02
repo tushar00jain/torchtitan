@@ -20,6 +20,7 @@ from torchstore.transport import TransportType
 
 from torchtitan.experiments.rl.components.weight_sync import (
     resolve_weight_sync_transport_type,
+    WeightSyncConfig,
     WeightSyncManager,
 )
 
@@ -27,18 +28,42 @@ TRAINER_PUSH_KEY = "timing/weight_sync/trainer_push_model_state_dict"
 GENERATOR_PULL_KEY = "timing/weight_sync/generator_pull_model_state_dict"
 
 
+def test_weight_sync_config_preserves_defaults() -> None:
+    config = WeightSyncConfig()
+    assert not config.direct_rdma
+    assert config.direct_rdma_backend == "monarch"
+
+
+@pytest.mark.parametrize("backend", ["rdma4py", "torchcomms"])
+def test_weight_sync_config_accepts_direct_backends(backend) -> None:
+    config = WeightSyncConfig(direct_rdma=True, direct_rdma_backend=backend)
+    assert config.direct_rdma
+    assert config.direct_rdma_backend == backend
+
+
+def test_weight_sync_backend_requires_direct_rdma() -> None:
+    with pytest.raises(ValueError, match="direct_rdma=True"):
+        WeightSyncConfig(direct_rdma_backend="rdma4py")
+
+
 @pytest.mark.parametrize(
-    ("transport", "expected"),
+    ("backend", "expected"),
     [
-        ("auto", TransportType.Unset),
-        ("gloo", TransportType.Gloo),
-        ("monarch_rdma", TransportType.MonarchRDMA),
-        ("monarch_rpc", TransportType.MonarchRPC),
+        ("monarch", TransportType.MonarchRDMA),
+        ("rdma4py", TransportType.Rdma4Py),
         ("torchcomms", TransportType.TorchComms),
     ],
 )
-def test_staged_backend_selects_strategy_transport(transport, expected) -> None:
-    assert resolve_weight_sync_transport_type(transport) == expected
+def test_direct_backend_selects_strategy_transport(backend, expected) -> None:
+    config = WeightSyncConfig(direct_rdma=True, direct_rdma_backend=backend)
+
+    assert resolve_weight_sync_transport_type(config, "auto") == expected
+
+
+def test_staged_backend_selects_strategy_transport() -> None:
+    config = WeightSyncConfig()
+
+    assert resolve_weight_sync_transport_type(config, "gloo") == TransportType.Gloo
 
 
 class _Endpoint:

@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Literal, TYPE_CHECKING
 
 from torchstore.transport import TransportType
 
+from torchtitan.config import Configurable
 from torchtitan.experiments.rl.components.work_buffer import RolloutGroupWorkBuffer
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.observability import structured_logger as sl
@@ -30,13 +32,42 @@ WEIGHT_SYNC_TRANSPORT_TYPES: dict[str, TransportType] = {
     "gloo": TransportType.Gloo,
     "monarch_rdma": TransportType.MonarchRDMA,
     "monarch_rpc": TransportType.MonarchRPC,
+    "rdma4py": TransportType.Rdma4Py,
     "torchcomms": TransportType.TorchComms,
 }
 
+DIRECT_WEIGHT_SYNC_TRANSPORT_TYPES: dict[str, TransportType] = {
+    "monarch": TransportType.MonarchRDMA,
+    "rdma4py": TransportType.Rdma4Py,
+    "torchcomms": TransportType.TorchComms,
+}
+
+
+@dataclass(kw_only=True, slots=True)
+class WeightSyncConfig(Configurable.Config):
+    """TorchStore policy-weight synchronization settings."""
+
+    direct_rdma: bool = False
+    """Transfer directly from trainer GPUs instead of staging in StorageVolumes."""
+
+    direct_rdma_backend: Literal["monarch", "rdma4py", "torchcomms"] = "monarch"
+    """Direct GPU RDMA data plane selected on the TorchStore strategy."""
+
+    def __post_init__(self) -> None:
+        if not self.direct_rdma and self.direct_rdma_backend != "monarch":
+            raise ValueError(
+                "weight_sync.direct_rdma_backend requires "
+                "weight_sync.direct_rdma=True"
+            )
+
+
 def resolve_weight_sync_transport_type(
+    config: WeightSyncConfig,
     staged_transport: str,
 ) -> TransportType:
-    """Resolve the configured staged TorchStore transport."""
+    """Resolve the one transport configured on the TorchStore strategy."""
+    if config.direct_rdma:
+        return DIRECT_WEIGHT_SYNC_TRANSPORT_TYPES[config.direct_rdma_backend]
     return WEIGHT_SYNC_TRANSPORT_TYPES[staged_transport]
 
 
