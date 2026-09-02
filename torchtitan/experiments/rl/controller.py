@@ -113,7 +113,11 @@ from torchtitan.experiments.rl.components.batcher import Batcher
 from torchtitan.experiments.rl.components.training_sample_builder import (
     TrainingSampleBuilder,
 )
-from torchtitan.experiments.rl.components.weight_sync import WeightSyncManager
+from torchtitan.experiments.rl.components.weight_sync import (
+    resolve_weight_sync_transport_type,
+    WEIGHT_SYNC_TRANSPORT_TYPES,
+    WeightSyncManager,
+)
 from torchtitan.experiments.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
@@ -295,6 +299,13 @@ class Controller(Configurable):
         async_loop: AsyncLoopConfig = field(default_factory=AsyncLoopConfig)
         """How the data->rollout->batch->train loop is sized and coordinated."""
 
+        weight_sync_transport: str = "auto"
+        """TorchStore transport used for policy-weight synchronization.
+
+        ``auto`` preserves TorchStore's normal per-transfer selection. A named
+        transport pins all weight-sync PUTs and GETs for controlled benchmarks.
+        """
+
         rollouter: Rollouter.Config
         """The rollouter: its datasets, envs, and rubric."""
         # TODO: support multiple rollouters for data mixing.
@@ -341,6 +352,11 @@ class Controller(Configurable):
             if self.num_generators < 1:
                 raise ValueError(
                     f"num_generators must be at least 1, got {self.num_generators}"
+                )
+            if self.weight_sync_transport not in WEIGHT_SYNC_TRANSPORT_TYPES:
+                raise ValueError(
+                    f"Unknown weight_sync_transport {self.weight_sync_transport!r}; "
+                    f"valid values are {sorted(WEIGHT_SYNC_TRANSPORT_TYPES)}"
                 )
             if self.generator.checkpoint.enable:
                 raise ValueError(
@@ -632,6 +648,11 @@ class Controller(Configurable):
                 generators=generators,
             )
 
+        logger.info(
+            "[weight-sync] transport=%s",
+            config.weight_sync_transport,
+        )
+
         # Initialize TorchStore for weight sync between trainer and generator.
         # StorageVolumes are spawned on the trainer mesh so they are colocated
         # with the weight source for faster data access in the non-RDMA path.
@@ -639,7 +660,15 @@ class Controller(Configurable):
         #   LOCAL_RANK, so colocated processes share the same volume.
         # https://github.com/meta-pytorch/torchstore
         with sl.log_trace_span("torchstore_init"):
-            await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
+            transport_type = resolve_weight_sync_transport_type(
+                config.weight_sync_transport,
+            )
+            await ts.initialize(
+                mesh=trainer_mesh,
+                strategy=ts.LocalRankStrategy(
+                    default_transport_type=transport_type
+                ),
+            )
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored policy_version
         # (0 if fresh) so the loop resumes at the right step and generators pull at that version.
