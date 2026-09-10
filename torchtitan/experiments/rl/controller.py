@@ -115,6 +115,7 @@ from torchtitan.experiments.rl.components.training_sample_builder import (
 from torchtitan.experiments.rl.components.weight_sync import (
     resolve_weight_sync_transport_type,
     WEIGHT_SYNC_TRANSPORT_TYPES,
+    WeightSyncConfig,
     WeightSyncManager,
 )
 from torchtitan.experiments.rl.components.work_buffer import (
@@ -298,8 +299,11 @@ class Controller(Configurable):
         async_loop: AsyncLoopConfig = field(default_factory=AsyncLoopConfig)
         """How the data->rollout->batch->train loop is sized and coordinated."""
 
+        weight_sync: WeightSyncConfig = field(default_factory=WeightSyncConfig)
+        """TorchStore direct-transfer and data-plane selection."""
+
         weight_sync_transport: str = "auto"
-        """TorchStore transport used for policy-weight synchronization.
+        """TorchStore transport used when ``weight_sync.direct_rdma`` is false.
 
         ``auto`` preserves TorchStore's normal per-transfer selection. A named
         transport pins all weight-sync PUTs and GETs for controlled benchmarks.
@@ -362,6 +366,11 @@ class Controller(Configurable):
                 raise ValueError(
                     f"Unknown weight_sync_transport {self.weight_sync_transport!r}; "
                     f"valid values are {sorted(WEIGHT_SYNC_TRANSPORT_TYPES)}"
+                )
+            if self.weight_sync.direct_rdma and self.weight_sync_transport != "auto":
+                raise ValueError(
+                    "weight_sync_transport selects the normal TorchStore transport "
+                    "path and cannot be combined with weight_sync.direct_rdma=True"
                 )
             if self.generator.checkpoint.enable:
                 raise ValueError(
@@ -629,6 +638,7 @@ class Controller(Configurable):
                 generator_dtype=config.generator.model_dtype,
                 compile_config=config.compile,
                 output_dir=config.dump_folder,
+                direct_rdma=config.weight_sync.direct_rdma,
             )
 
             # TODO: torch.compile with aot_eager backend (inductor crashes the vLLM engine on the shared model path).
@@ -646,6 +656,7 @@ class Controller(Configurable):
                     compile_config=config.compile,
                     max_num_seqs=max_num_seqs,
                     output_dir=config.dump_folder,
+                    direct_rdma=config.weight_sync.direct_rdma,
                 )
                 generators.append(generator)
             self.generator_router = router_mesh.spawn(
@@ -662,8 +673,10 @@ class Controller(Configurable):
             )
 
         logger.info(
-            "[weight-sync] transport=%s",
+            "[weight-sync] transport=%s direct_rdma=%s direct_backend=%s",
             config.weight_sync_transport,
+            config.weight_sync.direct_rdma,
+            config.weight_sync.direct_rdma_backend,
         )
 
         # Initialize TorchStore for weight sync between trainer and generator.
@@ -674,6 +687,7 @@ class Controller(Configurable):
         # https://github.com/meta-pytorch/torchstore
         with sl.log_trace_span("torchstore_init"):
             transport_type = resolve_weight_sync_transport_type(
+                config.weight_sync,
                 config.weight_sync_transport,
             )
             await ts.initialize(
