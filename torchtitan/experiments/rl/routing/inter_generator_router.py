@@ -215,19 +215,23 @@ class InterGeneratorRouter(Actor, Configurable):
             return_exceptions=return_exceptions,
         )
 
-    async def _pull_model_state_dict(self, *, policy_version: int) -> None:
+    async def _pull_model_state_dict(
+        self, *, policy_version: int
+    ) -> dict[str, float] | None:
         """Pull the given policy version's state dict into every generator.
 
         Args:
             policy_version: Trainer policy version whose state dict to pull.
         """
 
-        async def _pull_one(h: _GeneratorHandle) -> None:
+        async def _pull_one(h: _GeneratorHandle) -> dict[str, float] | None:
             if self._config.hot_swap:
                 # Hot swap: pull concurrently with in-flight generation, without
                 # draining. Whether the pull is genuinely concurrent and safe is
                 # up to the generator's implementation.
-                await h.rank0_actor.pull_model_state_dict.call_one(policy_version)
+                return await h.rank0_actor.pull_model_state_dict.call_one(
+                    policy_version
+                )
             else:
                 # Drain: stop routing to this generator and wait for in-flight
                 # work to finish before pulling, then re-admit it.
@@ -235,7 +239,9 @@ class InterGeneratorRouter(Actor, Configurable):
                 try:
                     with sl.log_trace_span("router_drain_wait"):
                         await h.idle.wait()
-                    await h.rank0_actor.pull_model_state_dict.call_one(policy_version)
+                    return await h.rank0_actor.pull_model_state_dict.call_one(
+                        policy_version
+                    )
                 finally:
                     self._set_state(h, _GeneratorState.SERVING)
 
@@ -245,7 +251,21 @@ class InterGeneratorRouter(Actor, Configurable):
         # TODO(perf): stagger the per-generator fetches when num_generators is large so they don't
         #   all read the trainer's CPU-staged weights at once -- bounds trainer host RAM. Matters for
         #   big models / many generators, not at small scale.
-        await asyncio.gather(*[_pull_one(h) for h in self._generators])
+        results = await asyncio.gather(*[_pull_one(h) for h in self._generators])
+        populated = [result for result in results if result is not None]
+        if not populated:
+            return None
+
+        keys = {key for result in populated for key in result}
+        combined: dict[str, float] = {}
+        for key in keys:
+            values = [result[key] for result in populated if key in result]
+            combined[key] = (
+                max(values)
+                if key.endswith("/max")
+                else sum(values) / len(values)
+            )
+        return combined
 
     @concurrent_endpoint
     async def generate(
@@ -286,11 +306,13 @@ class InterGeneratorRouter(Actor, Configurable):
         await self._fanout("sync_log_step", step)
 
     @concurrent_endpoint
-    async def pull_model_state_dict(self, policy_version: int) -> None:
+    async def pull_model_state_dict(
+        self, policy_version: int
+    ) -> dict[str, float] | None:
         """Pull the given policy version's state dict into every generator."""
         # Wrapper the logic in a private method so we can test it independently
         # without the need to spawn the Monarch actor mesh.
-        await self._pull_model_state_dict(policy_version=policy_version)
+        return await self._pull_model_state_dict(policy_version=policy_version)
 
     @concurrent_endpoint
     async def close_generators(self) -> list[Any | BaseException]:
