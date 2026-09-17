@@ -806,6 +806,7 @@ class VLLMGenerator(Actor, Configurable):
         compile_config: CompileConfig,
         max_num_seqs: int,
         output_dir: str,
+        direct_rdma: bool = False,
     ):
         init_logger()
         # Quiet torchstore's per-op transport-resolve INFO spam (very noisy in CI).
@@ -820,6 +821,7 @@ class VLLMGenerator(Actor, Configurable):
 
         self.config = config
         self.model_spec = model_spec
+        self._direct_rdma = direct_rdma
 
         self._max_num_seqs = max_num_seqs
 
@@ -1379,7 +1381,7 @@ class VLLMGenerator(Actor, Configurable):
             "model_state_dict",
             user_state_dict=dtensor_model_sd,
             strict=False,
-            direct_rdma=False,
+            direct_rdma=self._direct_rdma,
         )
 
         model_sd.update(dtensor_to_plain_tensor_state_dict(dtensor_model_sd))
