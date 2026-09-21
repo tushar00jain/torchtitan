@@ -35,8 +35,10 @@ from torchtitan.rl.distributed.parallelism import InferenceParallelismConfig
 from torchtitan.rl.distributed.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.distributed.routing.strategies import LeastLoadedRoutingStrategy
 from torchtitan.rl.generator import (
+    _capture_weight_storage_fingerprints,
     _extract_request_metrics_inputs,
     _prepare_generation_request_metrics,
+    _verify_weight_storage_fingerprints,
     GenerationFuture,
     RequestDispatcher,
     SamplingConfig,
@@ -462,6 +464,39 @@ def test_only_weights_use_cumem_allocator(monkeypatch):
         assert value == "weights"
     with worker._maybe_get_memory_pool_context("other") as value:
         assert value is None
+
+
+def test_cumem_weight_storage_verification_allows_in_place_updates():
+    model = torch.nn.Linear(4, 3)
+    fingerprints = _capture_weight_storage_fingerprints(model)
+
+    with torch.no_grad():
+        model.weight.add_(1)
+
+    _verify_weight_storage_fingerprints(model, fingerprints)
+
+
+def test_cumem_weight_storage_verification_rejects_reallocation():
+    model = torch.nn.Linear(4, 3)
+    fingerprints = _capture_weight_storage_fingerprints(model)
+    model.weight = torch.nn.Parameter(model.weight.detach().clone())
+
+    with pytest.raises(
+        RuntimeError,
+        match="model parameter 'weight' changed storage or layout",
+    ):
+        _verify_weight_storage_fingerprints(model, fingerprints)
+
+
+def test_cumem_weight_storage_verification_requires_cumem_allocator():
+    with pytest.raises(
+        ValueError,
+        match="verify_cumem_weight_storage requires enable_cumem_allocator=True",
+    ):
+        VLLMGenerator.Config(
+            enable_cumem_allocator=False,
+            verify_cumem_weight_storage=True,
+        )
 
 
 def test_cuda_graph_default_mode_is_full():
