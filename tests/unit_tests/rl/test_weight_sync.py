@@ -19,12 +19,17 @@ import pytest
 import tyro
 
 from torchtitan.rl.distributed.weight_sync import (
+    TRANSPORT_TIMING_METRICS,
     WeightSyncConfig,
     WeightSyncManager,
 )
 
 TRAINER_PUSH_KEY = "timing/weight_sync/trainer_push_model_state_dict"
 GENERATOR_PULL_KEY = "timing/weight_sync/generator_pull_model_state_dict"
+TRANSPORT_TIMING_KEYS = [
+    f"timing/weight_sync/{name.removesuffix('_seconds')}"
+    for name in TRANSPORT_TIMING_METRICS
+]
 
 
 def test_weight_sync_config_preserves_defaults() -> None:
@@ -124,7 +129,10 @@ def test_push_then_pull_then_buffer_release_in_order() -> None:
         # The pull reads what the push wrote, and the buffer-slot release rides on the pull.
         assert events == ["push", "pull", "release"]
         assert [metric.key for metric in push_metrics] == [TRAINER_PUSH_KEY]
-        assert [metric.key for metric in pull_metrics] == [GENERATOR_PULL_KEY]
+        assert [metric.key for metric in pull_metrics] == [
+            GENERATOR_PULL_KEY,
+            *TRANSPORT_TIMING_KEYS,
+        ]
 
     asyncio.run(run())
 

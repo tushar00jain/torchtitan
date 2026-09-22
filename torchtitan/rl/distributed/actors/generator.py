@@ -68,8 +68,8 @@ class _GeneratorActorEndpoints:
         )
 
     @concurrent_endpoint
-    async def pull_model_state_dict(self, version: int) -> None:
-        await super().pull_model_state_dict(version)
+    async def pull_model_state_dict(self, version: int) -> dict[str, float]:
+        return await super().pull_model_state_dict(version)
 
     @concurrent_endpoint
     async def attach_weight_sync(self) -> None:

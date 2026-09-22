@@ -24,6 +24,20 @@ if TYPE_CHECKING:
     from torchtitan.rl.trainer import Trainer
 
 
+TRANSPORT_TIMING_METRICS = (
+    "nixl_prepare_seconds",
+    "nixl_client_prepare_seconds",
+    "torchstore_request_delivery_seconds",
+    "torchstore_server_lookup_seconds",
+    "nixl_server_prepare_seconds",
+    "nixl_completion_wait_seconds",
+    "torchstore_server_return_seconds",
+    "torchstore_response_delivery_seconds",
+    "torchstore_rpc_roundtrip_seconds",
+    "torchstore_rpc_nonserver_seconds",
+)
+
+
 @dataclass(kw_only=True, slots=True)
 class WeightSyncConfig(Configurable.Config):
     """TorchStore policy-weight synchronization settings."""
@@ -87,6 +101,9 @@ class WeightSyncManager:
         # Wall time of the push and pull of the last completed sync.
         self._last_push_s: float = 0.0
         self._last_pull_s: float = 0.0
+        self._last_transport_timings = {
+            metric_name: 0.0 for metric_name in TRANSPORT_TIMING_METRICS
+        }
 
     def start_async_push_pull(self, *, version: int) -> None:
         """Fire push -> pull -> buffer-slot release in the background; returns immediately.
@@ -115,7 +132,14 @@ class WeightSyncManager:
             m.Metric(
                 "timing/weight_sync/generator_pull_model_state_dict",
                 m.NoReduce(self._last_pull_s),
-            )
+            ),
+            *[
+                m.Metric(
+                    f"timing/weight_sync/{metric_name.removesuffix('_seconds')}",
+                    m.NoReduce(self._last_transport_timings[metric_name]),
+                )
+                for metric_name in TRANSPORT_TIMING_METRICS
+            ],
         ]
 
     async def wait_inflight_push_pull(self) -> None:
@@ -135,8 +159,15 @@ class WeightSyncManager:
         await push_task
         with sl.log_trace_span("generator_pull_model_state_dict"):
             start = time.perf_counter()
-            await self._generator_router.pull_model_state_dict.call_one(version)
+            transport_metrics = (
+                await self._generator_router.pull_model_state_dict.call_one(version)
+            )
             self._last_pull_s = time.perf_counter() - start
+            if transport_metrics:
+                self._last_transport_timings = {
+                    metric_name: transport_metrics.get(metric_name, 0.0)
+                    for metric_name in TRANSPORT_TIMING_METRICS
+                }
         # TODO(perf): pull_model_state_dict awaits ALL generators before we release any buffer slots,
         #   so a generator that finishes its pull early idles until the slowest one. Investigate
         #   per-generator release (router surfaces each pull's completion -> release that generator's
