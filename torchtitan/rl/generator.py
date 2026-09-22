@@ -13,7 +13,7 @@ import logging
 import math
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Annotated, Any, Literal
 
 import cloudpickle
@@ -55,6 +55,72 @@ from torchtitan.tools.utils import has_cuda_capability
 logger = logging.getLogger(__name__)
 
 # TODO(async-rl): this file is large. Split a backend-agnostic BaseGenerator.
+
+
+@dataclass(frozen=True, slots=True)
+class _WeightStorageFingerprint:
+    """Identity and layout of one model parameter's backing storage."""
+
+    parameter_id: int
+    storage_cdata: int
+    data_ptr: int
+    storage_data_ptr: int
+    storage_nbytes: int
+    storage_offset: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+
+
+def _capture_weight_storage_fingerprints(
+    model: torch.nn.Module,
+) -> dict[str, _WeightStorageFingerprint]:
+    fingerprints = {}
+    for name, parameter in model.named_parameters():
+        storage = parameter.untyped_storage()
+        fingerprints[name] = _WeightStorageFingerprint(
+            parameter_id=id(parameter),
+            storage_cdata=storage._cdata,
+            data_ptr=parameter.data_ptr(),
+            storage_data_ptr=storage.data_ptr(),
+            storage_nbytes=storage.nbytes(),
+            storage_offset=parameter.storage_offset(),
+            shape=tuple(parameter.shape),
+            stride=tuple(parameter.stride()),
+            dtype=parameter.dtype,
+            device=parameter.device,
+        )
+    return fingerprints
+
+
+def _verify_weight_storage_fingerprints(
+    model: torch.nn.Module,
+    expected: dict[str, _WeightStorageFingerprint],
+) -> None:
+    actual = _capture_weight_storage_fingerprints(model)
+    if actual.keys() != expected.keys():
+        missing = sorted(expected.keys() - actual.keys())
+        added = sorted(actual.keys() - expected.keys())
+        raise RuntimeError(
+            "model parameters changed during weight sync: "
+            f"missing={missing}, added={added}"
+        )
+
+    for name, expected_fingerprint in expected.items():
+        actual_fingerprint = actual[name]
+        if actual_fingerprint != expected_fingerprint:
+            changed = [
+                field_.name
+                for field_ in fields(_WeightStorageFingerprint)
+                if getattr(actual_fingerprint, field_.name)
+                != getattr(expected_fingerprint, field_.name)
+            ]
+            raise RuntimeError(
+                f"model parameter {name!r} changed storage or layout during "
+                f"weight sync: changed={changed}, "
+                f"before={expected_fingerprint}, after={actual_fingerprint}"
+            )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -736,6 +802,13 @@ class VLLMGenerator(Configurable):
         that pool.
         """
 
+        verify_cumem_weight_storage: bool = False
+        """Fail if a model parameter's storage or layout changes after a pull.
+
+        This diagnostic verifies that weight sync updates the CuMem-backed
+        parameters in place, preserving the addresses registered with NIXL.
+        """
+
         max_num_batched_tokens: int | None = None
         """vLLM chunked-prefill chunk size: max tokens scheduled per engine step
         (prefill + decode, summed over the batch). ``None`` (default) leaves
@@ -815,6 +888,10 @@ class VLLMGenerator(Configurable):
                 raise ValueError(
                     "reset_running_requests_on_weight_sync requires "
                     "reset_prefix_cache_on_weight_sync=True (it only matters as part of resetting the cache)"
+                )
+            if self.verify_cumem_weight_storage and not self.enable_cumem_allocator:
+                raise ValueError(
+                    "verify_cumem_weight_storage requires enable_cumem_allocator=True"
                 )
 
     def __init__(
@@ -1012,6 +1089,17 @@ class VLLMGenerator(Configurable):
                 f"DP layout mismatch on rank {self._rank}: our dp_rank "
                 f"({self._dp_rank}) != vLLM data_parallel_rank "
                 f"({vllm_parallel_config.data_parallel_rank})"
+            )
+
+        self._weight_storage_fingerprints = None
+        if config.verify_cumem_weight_storage:
+            self._weight_storage_fingerprints = _capture_weight_storage_fingerprints(
+                self._get_model().model
+            )
+            logger.info(
+                "Captured stable-storage fingerprints for %d CuMem-backed model "
+                "parameters",
+                len(self._weight_storage_fingerprints),
             )
 
         self.policy_version = 0
@@ -1379,6 +1467,16 @@ class VLLMGenerator(Configurable):
         # Re-apply the state dict to run that module's merge hook. Other params,
         # including native QKVLinear.wqkv, share storage with model_sd.
         model.model.load_state_dict(model_sd, strict=False)
+        if self._weight_storage_fingerprints is not None:
+            _verify_weight_storage_fingerprints(
+                model.model, self._weight_storage_fingerprints
+            )
+            logger.info(
+                "Verified stable storage for %d CuMem-backed model parameters "
+                "after weight pull version %d",
+                len(self._weight_storage_fingerprints),
+                version,
+            )
         self.policy_version = version
         if self.config.reset_prefix_cache_on_weight_sync:
             # TODO(async-rl): consider a `flush_kv_cache_every_n_steps` flag to force-flush every N steps
