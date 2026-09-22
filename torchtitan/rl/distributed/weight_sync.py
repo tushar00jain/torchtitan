@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
 
+from torchtitan.config import Configurable
 from torchtitan.observability import structured_logger as sl
 
 from torchtitan.rl.components.work_buffer import RolloutGroupWorkBuffer
@@ -20,6 +22,22 @@ from torchtitan.rl.observability import metrics as m
 if TYPE_CHECKING:
     from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
     from torchtitan.rl.trainer import Trainer
+
+
+@dataclass(kw_only=True, slots=True)
+class WeightSyncConfig(Configurable.Config):
+    """TorchStore policy-weight synchronization settings."""
+
+    mode: Literal["controller", "routing"] = "controller"
+    """Use controller lookups or a precomputed local routing plan."""
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("controller", "routing"):
+            raise ValueError(
+                f"Unknown weight_sync.mode {self.mode!r}; "
+                "expected 'controller' or 'routing'"
+            )
+
 
 # dummy no-op for step 0, used in WeightSyncManager
 async def _noop() -> None:

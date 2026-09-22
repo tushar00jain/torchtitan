@@ -119,7 +119,7 @@ from torchtitan.rl.components.work_buffer import (
 from torchtitan.rl.distributed.actors.generator import VLLMGeneratorActor
 from torchtitan.rl.distributed.actors.trainer import TrainerActor
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
-from torchtitan.rl.distributed.weight_sync import WeightSyncManager
+from torchtitan.rl.distributed.weight_sync import WeightSyncConfig, WeightSyncManager
 from torchtitan.rl.generator import SamplingConfig, VLLMGenerator
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
@@ -290,6 +290,9 @@ class Controller(Configurable):
 
         async_loop: AsyncLoopConfig = field(default_factory=AsyncLoopConfig)
         """How the data->rollout->batch->train loop is sized and coordinated."""
+
+        weight_sync: WeightSyncConfig = field(default_factory=WeightSyncConfig)
+        """TorchStore weight-sync mode selection."""
 
         rollouter: Rollouter.Config
         """The rollouter: its datasets, envs, and rubric."""
@@ -626,6 +629,7 @@ class Controller(Configurable):
                     compile_config=config.compile,
                     max_num_seqs=max_num_seqs,
                     output_dir=config.dump_folder,
+                    replica_idx=idx,
                 )
                 generators.append(generator)
             self.generator_router = router_mesh.spawn(
@@ -641,14 +645,35 @@ class Controller(Configurable):
                 hf_assets_path=config.hf_assets_path,
             )
 
+        logger.info("[weight-sync] mode=%s", config.weight_sync.mode)
+
         # Initialize TorchStore for weight sync between trainer and generator.
-        # StorageVolumes are spawned on the trainer mesh so they are colocated
-        # with the weight source for faster data access in the non-RDMA path.
-        # LocalRankStrategy: routes each process to a storage volume based on
+        # Both paths place StorageVolumes on the trainer mesh. Routing also
+        # registers the generator meshes so TorchStore can plan each transfer.
+        # LocalRankStrategy routes each process to a storage volume based on
         #   LOCAL_RANK, so colocated processes share the same volume.
-        # https://github.com/meta-pytorch/torchstore
         with sl.log_trace_span("torchstore_init"):
-            await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
+            if config.weight_sync.mode == "routing":
+                # Routing spans the trainer and generator meshes, so volumes
+                # are indexed per mesh rather than by local rank.
+                await ts.initialize(
+                    mesh=trainer_mesh,
+                    relay_meshes=generator_meshes,
+                    strategy=ts.TorchStoreStrategy(),
+                )
+                # Every rank registers its own layout with TorchStore; these
+                # calls return once the routes are installed everywhere.
+                await asyncio.gather(
+                    self.trainer.attach_weight_sync.call(),
+                    *(
+                        generator.attach_weight_sync.call()
+                        for generator in generators
+                    ),
+                )
+            else:
+                await ts.initialize(
+                    mesh=trainer_mesh, strategy=ts.LocalRankStrategy()
+                )
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored policy_version
         # (0 if fresh) so the loop resumes at the right step and generators pull at that version.
