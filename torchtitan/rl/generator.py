@@ -207,9 +207,9 @@ def _prepare_generation_request_metrics(
                 inputs.last_token_ts - inputs.first_token_ts
             ) * 1000
             metric_values[f"{prefix}/decode_time_ms"] = first_to_last_token_ms
-            metric_values[f"{prefix}/inter_token_latency_ms"] = (
-                first_to_last_token_ms / (inputs.num_generation_tokens - 1)
-            )
+            metric_values[
+                f"{prefix}/inter_token_latency_ms"
+            ] = first_to_last_token_ms / (inputs.num_generation_tokens - 1)
 
     # Emit each value with both Mean and Max aggregators.
     return [
@@ -1141,7 +1141,9 @@ class VLLMGenerator(Configurable):
         self._model_state_dict_pull_request: ModelStateDictPullRequest | None = None
         self._close_request: CloseRequest | None = None
 
-        self._pull_model_state_dict_future: asyncio.Future[int] | None = None
+        self._pull_model_state_dict_future: asyncio.Future[
+            dict[str, float]
+        ] | None = None
 
         # Background asyncio.Task running _engine_loop; None until start_engine_loop starts it.
         self._engine_loop_task: asyncio.Task | None = None
@@ -1474,7 +1476,7 @@ class VLLMGenerator(Configurable):
         await ts.client(role=RankRole.REQUESTER, group=requester_index)
 
     @sl.log_trace_span("pull_model_state_dict")
-    async def pull_model_state_dict(self, version: int) -> None:
+    async def pull_model_state_dict(self, version: int) -> dict[str, float]:
         """Queues a weight pull for `version` and blocks until the engine loop has finished pulling.
 
         With CPU weight prefetch enabled, the network transfer has already
@@ -1492,9 +1494,9 @@ class VLLMGenerator(Configurable):
         self._rank0_check_engine_loop_running("pull_model_state_dict")
 
         # A placeholder future for the engine loop to resolve once the pull has been applied.
-        pull_model_state_dict_future: asyncio.Future[int] = (
-            asyncio.get_running_loop().create_future()
-        )
+        pull_model_state_dict_future: asyncio.Future[
+            dict[str, float]
+        ] = asyncio.get_running_loop().create_future()
 
         # `_engine_loop_condition` wakes the engine loop, if asleep, when a pull is queued.
         async with self._engine_loop_condition:
@@ -1505,7 +1507,7 @@ class VLLMGenerator(Configurable):
             self._engine_loop_condition.notify()  # wakes the engine loop only if it is idle
 
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
-        await pull_model_state_dict_future
+        return await pull_model_state_dict_future
 
     @sl.log_trace_span("prefetch_model_state_dict")
     async def prefetch_model_state_dict(self) -> None:
@@ -1532,7 +1534,22 @@ class VLLMGenerator(Configurable):
         # live trainer GPU tensors while optimizer steps may be mutating them.
         model = self._get_model()
         model_sd = model.model.state_dict()
-        await self._get_spmd_state_dict(model_sd, model=model)
+        transport_metrics = await self._get_spmd_state_dict(model_sd, model=model)
+        if transport_metrics:
+            metric_names = sorted(transport_metrics)
+            metric_values = torch.tensor(
+                [transport_metrics[name] for name in metric_names],
+                dtype=torch.float64,
+            )
+            await asyncio.to_thread(
+                dist.all_reduce,
+                metric_values,
+                op=dist.ReduceOp.MAX,
+                group=self._broadcast_group,
+            )
+            transport_metrics = dict(
+                zip(metric_names, metric_values.tolist(), strict=True)
+            )
         # With CPU prefetch, model_sd instead contains the prefetched CPU tensors,
         # and this load performs the local CPU-to-GPU copy.
         # Fused grouped experts still expose hook-produced w1/w3 copies, so the
@@ -1563,11 +1580,11 @@ class VLLMGenerator(Configurable):
         # Rank 0 holds the pull's future. Until this is resolved,
         # no new requests are admitted or processed.
         if self._rank == 0 and self._pull_model_state_dict_future is not None:
-            self._pull_model_state_dict_future.set_result(version)
+            self._pull_model_state_dict_future.set_result(transport_metrics)
             self._pull_model_state_dict_future = None
             self._model_state_dict_pull_request = None
 
-    async def _get_spmd_state_dict(self, model_sd: dict, *, model) -> None:
+    async def _get_spmd_state_dict(self, model_sd: dict, *, model) -> dict[str, float]:
         """Fetch trainer-pushed weights into a spmd_types generator state dict.
 
         spmd_types generators hold plain local tensors, but TorchStore already
@@ -1596,6 +1613,8 @@ class VLLMGenerator(Configurable):
             )
 
         model_sd.update(dtensor_to_plain_tensor_state_dict(dtensor_model_sd))
+        store = await ts.client()
+        return getattr(store, "last_get_transport_metrics", {})
 
     async def close(self) -> None:
         """Stop the engine loop, then release the vLLM engine.
