@@ -70,6 +70,10 @@ class _GeneratorActorEndpoints:
         await super().pull_model_state_dict(version)
 
     @concurrent_endpoint
+    async def stage_model_state_dict(self) -> None:
+        await super().stage_model_state_dict()
+
+    @concurrent_endpoint
     async def close(self) -> None:
         await super().close()
 

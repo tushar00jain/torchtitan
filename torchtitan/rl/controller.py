@@ -608,6 +608,7 @@ class Controller(Configurable):
                 InterGeneratorRouter,
                 config.generator_router,
                 generators=generators,
+                enable_cpu_weight_staging=config.generator.enable_cpu_weight_staging,
             )
 
             await self._rollouter.setup_async(

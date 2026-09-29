@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 import torchstore as ts
 import tyro
+from torch.distributed._state_dict_utils import _create_cpu_state_dict
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
@@ -634,6 +635,8 @@ class VLLMGenerator(Configurable):
     """vLLM engine to drive concurrent `generate` calls through one SPMD engine loop.
 
     The controller fires independent calls (`generate`, `pull_model_state_dict`, `close`).
+    With CPU weight staging enabled, the router also calls
+    `stage_model_state_dict` before `pull_model_state_dict`.
     Rank 0 processes them, enqueue a `LoopDecision` and awaits a future. One background `_engine_loop` per rank
     consumes the queue and executes the action. Rank 0 resolves each future when its request finishes and return
     the result back to the controller.
@@ -666,6 +669,9 @@ class VLLMGenerator(Configurable):
     A weight sync rides the same loop: `pull_model_state_dict` queues a `LoopDecision(LoopAction.PULL_MODEL_STATE_DICT)` applied
     between step bursts. The engine does NOT drain in-flight requests first ("hotswap"). This behavior can be changed
     in the inter-generator router, by blocking new requests until the engine is drained.
+
+    With CPU weight staging enabled, the network transfer into pinned CPU memory
+    happens before this loop action, which then performs the local CPU-to-GPU copy.
 
     Args:
         config: Generator-specific configuration.
@@ -715,8 +721,8 @@ class VLLMGenerator(Configurable):
         gpu_memory_limit: float = 0.9
         """Fraction of GPU memory to use for the vLLM engine (0.0 to 1.0)."""
 
-        enable_cumem_allocator: bool = True
-        """Use vLLM's CuMem pool for tensors transferred over RDMA.
+        enable_cumem_allocator: bool = False
+        """Use vLLM's CuMem pool for model weights transferred directly over RDMA.
 
         TorchTitan enables PyTorch's expandable-segments allocator to reduce
         fragmentation. It can change the physical GPU memory behind an address,
@@ -724,7 +730,8 @@ class VLLMGenerator(Configurable):
 
         vLLM's CuMem pool disables expandable segments for its allocations,
         keeping their memory mappings stable. This option puts model weights in
-        that pool.
+        that pool. It is not needed when ``enable_cpu_weight_staging=True``
+        because RDMA targets the persistent CPU buffers instead.
         """
 
         max_num_batched_tokens: int | None = None
@@ -754,6 +761,13 @@ class VLLMGenerator(Configurable):
         of more requests to avoid a prefill between every engine decode step, which is inefficient."""
 
         # TODO: check if we should put these under WeightSyncConfig
+        enable_cpu_weight_staging: bool = True
+        """Stage model weights in pinned CPU memory before applying them on GPU.
+
+        Disabling this for direct-to-GPU RDMA requires
+        ``enable_cumem_allocator=True`` so registered GPU memory remains stable.
+        """
+
         reset_prefix_cache_on_weight_sync: bool = True
         """Drop the prefix cache when weights change so new requests don't reuse KV computed under the old
         weights. vLLM only clears it while the engine is idle (true under sync training)."""
@@ -991,6 +1005,19 @@ class VLLMGenerator(Configurable):
             )
 
         self.policy_version = 0
+        self._staged_model_state_dict: dict[str, Any] | None = None
+        if config.enable_cpu_weight_staging:
+            model = self._get_model()
+            model_sd = plain_tensor_to_dtensor_state_dict(
+                model.model.state_dict(),
+                state_dict_layouts=model.get_state_dict_layouts(),
+                parallelism_context=model.parallelism_context,
+            )
+            # Preserve the DTensor layouts while replacing their local storage
+            # with persistent pinned CPU buffers.
+            self._staged_model_state_dict = _create_cpu_state_dict(
+                model_sd, pin_memory=True
+            )
 
         # --- Continuous-batching state (see the class docstring) ---
         self._broadcast_group = dist.new_group(backend="gloo")  # for LoopDecisions
@@ -1300,6 +1327,9 @@ class VLLMGenerator(Configurable):
     async def pull_model_state_dict(self, version: int) -> None:
         """Queues a weight pull for `version` and blocks until the engine loop has finished pulling.
 
+        With CPU weight staging enabled, the network transfer has already
+        completed and this pull applies the staged weights to the GPU.
+
         NOTE: In-flight requests are NOT drained here — the endpoint never drains; a caller that wants
         an idle engine holds off new `generate` calls until the queue drains, then calls this.
 
@@ -1327,10 +1357,26 @@ class VLLMGenerator(Configurable):
         # Await outside the lock so other generate / pull calls can proceed meanwhile.
         await pull_model_state_dict_future
 
+    @sl.log_trace_span("stage_model_state_dict")
+    async def stage_model_state_dict(self) -> None:
+        """Fetch weights into pinned CPU memory without interrupting generation."""
+        assert self.config.enable_cpu_weight_staging
+        assert self._staged_model_state_dict is not None
+
+        await ts.get_state_dict(
+            "model_state_dict",
+            user_state_dict=self._staged_model_state_dict,
+            strict=False,
+            direct_rdma=False,
+        )
+
     @sl.log_trace_span("pull_model_state_dict_copy")
     async def _pull_model_state_dict(self, version: int) -> None:
         """ALL RANKS: collectively copy the latest weights from TorchStore, optionally drop the
         prefix cache (so no new request reuses an old-weight prefix), and bump the policy version.
+
+        With CPU weight staging enabled, copy the already-fetched weights from
+        pinned CPU memory instead of fetching them from TorchStore here.
         """
         # Async RL uses a StorageVolume snapshot so generators do not read
         # live trainer GPU tensors while optimizer steps may be mutating them.
@@ -1341,6 +1387,8 @@ class VLLMGenerator(Configurable):
         # in-place fill above does not reach their physical w13 parameter.
         # Re-apply the state dict to run that module's merge hook. Other params,
         # including native QKVLinear.wqkv, share storage with model_sd.
+        # With CPU staging, model_sd instead contains the staged CPU tensors,
+        # and this load performs the local CPU-to-GPU copy.
         model.model.load_state_dict(model_sd, strict=False)
         self.policy_version = version
         if self.config.reset_prefix_cache_on_weight_sync:
@@ -1367,20 +1415,26 @@ class VLLMGenerator(Configurable):
         knows how to fill DTensor state-dict entries. Wrap each local tensor as
         a DTensor using its declared SPMD layout, fetch through the normal
         state-dict path, then put the local tensors back before load_state_dict.
+
+        With CPU weight staging enabled, use the previously fetched DTensor
+        state dict instead.
         """
+        if self.config.enable_cpu_weight_staging:
+            assert self._staged_model_state_dict is not None
+            dtensor_model_sd = self._staged_model_state_dict
+        else:
+            dtensor_model_sd = plain_tensor_to_dtensor_state_dict(
+                model_sd,
+                state_dict_layouts=model.get_state_dict_layouts(),
+                parallelism_context=model.parallelism_context,
+            )
 
-        dtensor_model_sd = plain_tensor_to_dtensor_state_dict(
-            model_sd,
-            state_dict_layouts=model.get_state_dict_layouts(),
-            parallelism_context=model.parallelism_context,
-        )
-
-        await ts.get_state_dict(
-            "model_state_dict",
-            user_state_dict=dtensor_model_sd,
-            strict=False,
-            direct_rdma=False,
-        )
+            await ts.get_state_dict(
+                "model_state_dict",
+                user_state_dict=dtensor_model_sd,
+                strict=False,
+                direct_rdma=False,
+            )
 
         model_sd.update(dtensor_to_plain_tensor_state_dict(dtensor_model_sd))
 
