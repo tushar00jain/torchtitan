@@ -244,8 +244,11 @@ class Controller(Configurable):
         controller = config.build()
         trainer_mesh = ...        # provisioned by the caller (see train.py)
         generator_meshes = ...
+        torchstore_mesh = ...
         await controller.setup_async(
-            trainer_mesh=trainer_mesh, generator_meshes=generator_meshes
+            trainer_mesh=trainer_mesh,
+            generator_meshes=generator_meshes,
+            torchstore_mesh=torchstore_mesh,
         )
         await controller.run()
     """
@@ -513,6 +516,7 @@ class Controller(Configurable):
         *,
         trainer_mesh: ProcMesh,
         generator_meshes: list[ProcMesh],
+        torchstore_mesh: ProcMesh,
     ):
         """Spawn Monarch actors on separate meshes and initialize weights.
 
@@ -521,15 +525,16 @@ class Controller(Configurable):
         weight push/pull are all ``await``-based runtime side effects
         that cannot run in a synchronous constructor.
 
-        The trainer and generator meshes are provisioned by the caller (see
-        ``spawn_proc_mesh``). The router and rollout worker meshes are created
-        on the controller host. This method spawns the actors and synchronizes
-        initial weights from trainer to generator. Must be called before
-        :meth:`run`.
+        The trainer, generator, and TorchStore meshes are provisioned by the
+        caller (see ``spawn_proc_mesh``). The router and rollout worker meshes
+        are created on the controller host. This method spawns the actors and
+        synchronizes initial weights from trainer to generator. Must be called
+        before :meth:`run`.
 
         Args:
             trainer_mesh: ProcMesh the trainer actor is spawned on.
             generator_meshes: ProcMesh objects the generator actors are spawned on.
+            torchstore_mesh: CPU ProcMesh the TorchStore actors are spawned on.
         """
         # Peak concurrent rollout sequences (groups * num_samples_per_prompt, or the validation pass); sizes max_num_seqs below.
         async_loop = self.config.async_loop
@@ -575,7 +580,12 @@ class Controller(Configurable):
             # loop for the controller's GIL.
             router_mesh = this_host().spawn_procs(per_host={"cpus": 1})
             # Store proc meshes for cleanup
-            self._proc_meshes = [router_mesh, trainer_mesh, *generator_meshes]
+            self._proc_meshes = [
+                router_mesh,
+                trainer_mesh,
+                *generator_meshes,
+                torchstore_mesh,
+            ]
 
             await setup_torch_elastic_env_async(trainer_mesh)
             for generator_mesh in generator_meshes:
@@ -626,13 +636,16 @@ class Controller(Configurable):
             )
 
         # Initialize TorchStore for weight sync between trainer and generator.
-        # StorageVolumes are spawned on the trainer mesh so they are colocated
-        # with the weight source for faster data access in the non-RDMA path.
+        # StorageVolumes run in separate CPU processes on the trainer hosts so
+        # storage work does not share the trainer actor processes.
         # LocalRankStrategy: routes each process to a storage volume based on
-        #   LOCAL_RANK, so colocated processes share the same volume.
+        #   rank. The TorchStore mesh therefore has one process per trainer rank.
         # https://github.com/meta-pytorch/torchstore
         with sl.log_trace_span("torchstore_init"):
-            await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
+            await ts.initialize(
+                mesh=torchstore_mesh,
+                strategy=ts.LocalRankStrategy(),
+            )
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored policy_version
         # (0 if fresh) so the loop resumes at the right step and generators pull at that version.
