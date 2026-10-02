@@ -24,6 +24,7 @@ class _FakeController:
         self.events = []
         self.setup_trainer_mesh = None
         self.setup_generator_meshes = None
+        self.setup_torchstore_mesh = None
         self.instances.append(self)
 
     async def setup_async(
@@ -31,10 +32,12 @@ class _FakeController:
         *,
         trainer_mesh=None,
         generator_meshes=None,
+        torchstore_mesh=None,
     ):
         self.events.append("setup")
         self.setup_trainer_mesh = trainer_mesh
         self.setup_generator_meshes = generator_meshes
+        self.setup_torchstore_mesh = torchstore_mesh
         if getattr(self.config, "fail_setup", False):
             raise RuntimeError("setup failed")
 
@@ -92,6 +95,31 @@ class _FakeConfigLoader:
 
     def load(self):
         return self.config
+
+
+class _FakeHostMesh:
+    def __init__(self, num_hosts: int):
+        self.num_hosts = num_hosts
+        self.spawn_kwargs = None
+
+    def __len__(self):
+        return self.num_hosts
+
+    def spawn_procs(self, **kwargs):
+        self.spawn_kwargs = kwargs
+        return "torchstore_mesh"
+
+
+def test_torchstore_gets_one_cpu_process_per_trainer_rank() -> None:
+    host_mesh = _FakeHostMesh(num_hosts=2)
+
+    torchstore_mesh = train._spawn_torchstore_mesh(host_mesh, trainer_world_size=8)
+
+    assert torchstore_mesh == "torchstore_mesh"
+    assert host_mesh.spawn_kwargs == {
+        "per_host": {"cpus": 4},
+        "bootstrap": train._preimport_torch,
+    }
 
 
 def test_async_loop_config_derives_window_and_max_offpolicy_steps() -> None:
@@ -175,6 +203,7 @@ def stub_mesh_provisioning(monkeypatch):
         return (
             "trainer_mesh",
             [f"generator_mesh_{idx}" for idx in range(num_generators)],
+            "torchstore_mesh",
         )
 
     monkeypatch.setattr(train, "spawn_proc_mesh", _spawn_proc_mesh)
@@ -191,6 +220,7 @@ def test_main_shuts_down_after_success(monkeypatch, stub_mesh_provisioning):
     assert trainer.events == ["setup", "train", "close"]
     assert trainer.setup_trainer_mesh == "trainer_mesh"
     assert trainer.setup_generator_meshes == ["generator_mesh_0"]
+    assert trainer.setup_torchstore_mesh == "torchstore_mesh"
 
 
 def test_main_passes_configured_num_generators(monkeypatch, stub_mesh_provisioning):

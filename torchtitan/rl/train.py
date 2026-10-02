@@ -12,7 +12,7 @@ This demonstrates:
    running on separate GPU meshes
 2. Weight synchronization across meshes via TorchStore: the trainer publishes its
    model state dict and the generator pulls it into its own parallelism layout,
-   with direct GPU-to-GPU RDMA transfer when available
+   with storage volumes running on a separate CPU process mesh
 3. Envs driven rollouts; reward and advantage computation live inline
    in the controller.
 
@@ -166,6 +166,22 @@ def _spawn_proc_mesh(
     )
 
 
+def _spawn_torchstore_mesh(
+    host_mesh: HostMesh,
+    trainer_world_size: int,
+) -> ProcMesh:
+    """Spawn one CPU TorchStore process for each trainer rank."""
+    nodes = len(host_mesh)
+    assert trainer_world_size % nodes == 0, (
+        f"trainer world size ({trainer_world_size}) must be evenly divisible by "
+        f"its host count ({nodes})"
+    )
+    return host_mesh.spawn_procs(
+        per_host={"cpus": trainer_world_size // nodes},
+        bootstrap=_preimport_torch,
+    )
+
+
 def spawn_proc_mesh(
     trainer_world_size: int,
     per_generator_world_size: int,
@@ -173,8 +189,8 @@ def spawn_proc_mesh(
     *,
     num_generators: int = 1,
     generator_env: dict[str, str] | None = None,
-) -> tuple[ProcMesh, list[ProcMesh]]:
-    """Spawn the trainer and generator proc meshes.
+) -> tuple[ProcMesh, list[ProcMesh], ProcMesh]:
+    """Spawn the trainer, generator, and TorchStore proc meshes.
 
     Args:
         trainer_world_size: Number of GPU procs to spawn for the trainer.
@@ -186,7 +202,7 @@ def spawn_proc_mesh(
         num_generators: Number of generator proc meshes to spawn.
 
     Returns:
-        The ``(trainer_mesh, generator_meshes)`` proc meshes.
+        The ``(trainer_mesh, generator_meshes, torchstore_mesh)`` proc meshes.
     """
     total_generator_gpus = num_generators * per_generator_world_size
     total_gpus = trainer_world_size + total_generator_gpus
@@ -212,6 +228,10 @@ def spawn_proc_mesh(
             bootstrap=_preimport_torch,
             role="trainer",
         )
+        torchstore_mesh = _spawn_torchstore_mesh(
+            trainer_host_mesh,
+            trainer_world_size,
+        )
         generator_meshes = [
             _spawn_proc_mesh(
                 gen_host_mesh,
@@ -235,6 +255,7 @@ def spawn_proc_mesh(
                 provisioner.allocate(trainer_world_size)
             ),
         )
+        torchstore_mesh = _spawn_torchstore_mesh(host_mesh, trainer_world_size)
         generator_meshes = [
             host_mesh.spawn_procs(
                 per_host={"gpus": per_generator_world_size},
@@ -248,7 +269,7 @@ def spawn_proc_mesh(
             for _ in range(num_generators)
         ]
 
-    return trainer_mesh, generator_meshes
+    return trainer_mesh, generator_meshes, torchstore_mesh
 
 
 async def main():
@@ -269,7 +290,7 @@ async def main():
         per_generator_world_size = _compute_generator_world_size(
             config.generator.parallelism
         )
-        trainer_mesh, generator_meshes = spawn_proc_mesh(
+        trainer_mesh, generator_meshes, torchstore_mesh = spawn_proc_mesh(
             trainer_world_size,
             per_generator_world_size,
             host_meshes=None,
@@ -278,6 +299,7 @@ async def main():
         await rl_trainer.setup_async(
             trainer_mesh=trainer_mesh,
             generator_meshes=generator_meshes,
+            torchstore_mesh=torchstore_mesh,
         )
         await rl_trainer.run()
     except (KeyboardInterrupt, asyncio.CancelledError):
