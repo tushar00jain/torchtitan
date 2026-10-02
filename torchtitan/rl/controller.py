@@ -120,7 +120,7 @@ from torchtitan.rl.components.work_buffer import (
 from torchtitan.rl.distributed.actors.generator import VLLMGeneratorActor
 from torchtitan.rl.distributed.actors.trainer import TrainerActor
 from torchtitan.rl.distributed.routing.inter_generator import InterGeneratorRouter
-from torchtitan.rl.distributed.weight_sync import WeightSyncManager
+from torchtitan.rl.distributed.weight_sync import WeightSyncConfig, WeightSyncManager
 from torchtitan.rl.generator import SamplingConfig, VLLMGenerator
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
@@ -265,6 +265,9 @@ class Controller(Configurable):
 
         async_loop: AsyncLoopConfig = field(default_factory=AsyncLoopConfig)
         """How the data->rollout->batch->train loop is sized and coordinated."""
+
+        weight_sync: WeightSyncConfig = field(default_factory=WeightSyncConfig)
+        """TorchStore weight-sync mode selection."""
 
         rollouter: Rollouter.Config
         """The rollouter: its datasets, envs, and rubric."""
@@ -631,7 +634,16 @@ class Controller(Configurable):
         #   LOCAL_RANK, so colocated processes share the same volume.
         # https://github.com/meta-pytorch/torchstore
         with sl.log_trace_span("torchstore_init"):
-            await ts.initialize(mesh=trainer_mesh, strategy=ts.LocalRankStrategy())
+            routing = config.weight_sync.mode == "routing"
+            await ts.initialize(
+                mesh=trainer_mesh,
+                strategy=(
+                    ts.TorchStoreStrategy() if routing else ts.LocalRankStrategy()
+                ),
+                client_type=(
+                    ts.ClientType.ROUTING if routing else ts.ClientType.STANDARD
+                ),
+            )
 
         # Resume: __init__ ran CheckpointManager.load(); read back the restored policy_version
         # (0 if fresh) so the loop resumes at the right step and generators pull at that version.
