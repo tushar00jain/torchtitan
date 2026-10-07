@@ -12,12 +12,13 @@ from dataclasses import dataclass
 
 import torch
 import torchstore as ts
+from torch.distributed.tensor import DTensor
 from torchstore import RankRole
 
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import apply_overrides, Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.validation import validate_model_training_config
-from torchtitan.distributed import utils as dist_utils
+from torchtitan.distributed import maybe_apply_numa_binding, utils as dist_utils
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
@@ -127,6 +128,7 @@ class Trainer(Configurable):
         self.model = engine.model_parts[0]
 
         engine.load_checkpoint()
+        self._push_staging_state_dict = self._setup_push_staging_state_dict()
         if config.checkpointer is None:
             logger.warning(
                 "Checkpoint disabled, skip weight loading and use random-initialized weights. "
@@ -329,32 +331,53 @@ class Trainer(Configurable):
         this returns and any number of generators can read the staged copy.
         """
         state_dict = self.model.state_dict()
-        if self._transfer_dtype is not None:
-            # torchstore only applies `transfer_dtype` on the RDMA path, so under direct_rdma=False
-            # cast to the generator dtype here (else the generator reads fp32 into its bf16 state dict).
-            # Exclude buffers from the cast: FSDP mixed precision casts params to the compute dtype but
-            # leaves buffers at their registered dtype (same as pretraining), e.g. the fp32
-            # expert_bias_E load-balance bias in MoE. The generator keeps those buffers at the same
-            # registered dtype, so casting them here would mismatch its state dict and fail torchstore's
-            # dtype check on weight sync.
-            # Strip the AC wrapper's `_checkpoint_wrapped_module` segment so buffer FQNs match state_dict() keys.
-            # TODO(async-rl): remove this manual cast once torchstore applies transfer_dtype on the
-            #   CPU-staged path.
-            buffer_names = {
-                canonical_fqn(name) for name, _ in self.model.named_buffers()
-            }
-            state_dict = {
-                name: (
-                    tensor if name in buffer_names else tensor.to(self._transfer_dtype)
-                )
-                for name, tensor in state_dict.items()
-            }
+        # torchstore only applies `transfer_dtype` on the RDMA path, so under direct_rdma=False
+        # cast to the generator dtype here (else the generator reads fp32 into its bf16 state dict).
+        # Exclude buffers from the cast: FSDP mixed precision casts params to the compute dtype but
+        # leaves buffers at their registered dtype (same as pretraining), e.g. the fp32
+        # expert_bias_E load-balance bias in MoE. The generator keeps those buffers at the same
+        # registered dtype, so casting them here would mismatch its state dict and fail torchstore's
+        # dtype check on weight sync.
+        # Strip the AC wrapper's `_checkpoint_wrapped_module` segment so buffer FQNs match state_dict() keys.
+        # TODO(async-rl): remove this manual cast once torchstore applies transfer_dtype on the
+        #   CPU-staged path.
+        for name, destination in self._push_staging_state_dict.items():
+            source = state_dict[name]
+            if isinstance(source, DTensor):
+                destination.to_local().copy_(source.to_local())
+            else:
+                destination.copy_(source)
 
         await ts.put_state_dict(
-            state_dict,
+            self._push_staging_state_dict,
             "model_state_dict",
             direct_rdma=False,
         )
+
+    def _setup_push_staging_state_dict(self) -> dict[str, torch.Tensor]:
+        """Allocate a final-dtype pinned CPU mirror of the model state dict."""
+        buffer_names = {canonical_fqn(name) for name, _ in self.model.named_buffers()}
+        state_dict = self.model.state_dict()
+        maybe_apply_numa_binding(self.engine.device.index, self.engine.device.type)
+        staging_state_dict = {}
+        for name, tensor in state_dict.items():
+            dtype = (
+                self._transfer_dtype
+                if self._transfer_dtype is not None and name not in buffer_names
+                else tensor.dtype
+            )
+            staging_tensor = torch.empty_like(
+                tensor,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=not isinstance(tensor, DTensor),
+            )
+            if isinstance(staging_tensor, DTensor):
+                staging_tensor._local_tensor = torch.empty_like(
+                    staging_tensor.to_local(), pin_memory=True
+                )
+            staging_state_dict[name] = staging_tensor
+        return staging_state_dict
 
     async def initialize_torchstore_client(self) -> None:
         """Initialize this process as a TorchStore routing publisher."""

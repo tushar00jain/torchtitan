@@ -55,6 +55,93 @@ def test_initialize_torchstore_client_uses_publisher_role() -> None:
     asyncio.run(run())
 
 
+def test_push_model_state_dict_reuses_final_dtype_cpu_staging_buffers() -> None:
+    async def run() -> None:
+        trainer = object.__new__(Trainer)
+        trainer.engine = SimpleNamespace(device=torch.device("cuda", 0))
+        trainer.model = torch.nn.Linear(2, 2, bias=False)
+        trainer.model.register_buffer("scale", torch.tensor(3.0, dtype=torch.float32))
+        trainer._transfer_dtype = torch.bfloat16
+
+        empty_like = torch.empty_like
+        pin_memory_requests = []
+
+        def allocate_without_pinning(*args, **kwargs):
+            pin_memory_requests.append(kwargs.get("pin_memory", False))
+            kwargs["pin_memory"] = False
+            return empty_like(*args, **kwargs)
+
+        with (
+            patch("torchtitan.rl.trainer.maybe_apply_numa_binding") as bind,
+            patch(
+                "torchtitan.rl.trainer.torch.empty_like",
+                side_effect=allocate_without_pinning,
+            ),
+        ):
+            trainer._push_staging_state_dict = trainer._setup_push_staging_state_dict()
+
+        staging = trainer._push_staging_state_dict
+        weight_data_ptr = staging["weight"].data_ptr()
+        scale_data_ptr = staging["scale"].data_ptr()
+        assert set(staging) == {"weight", "scale"}
+        assert staging["weight"].device.type == "cpu"
+        assert staging["weight"].dtype == torch.bfloat16
+        assert staging["scale"].dtype == torch.float32
+        assert pin_memory_requests == [True, True]
+        bind.assert_called_once_with(0, "cuda")
+
+        with patch(
+            "torchtitan.rl.trainer.ts.put_state_dict", new_callable=AsyncMock
+        ) as put_state_dict:
+            await trainer.push_model_state_dict()
+            trainer.model.weight.data.fill_(2.0)
+            await trainer.push_model_state_dict()
+
+        assert staging["weight"].data_ptr() == weight_data_ptr
+        torch.testing.assert_close(
+            staging["weight"],
+            torch.full((2, 2), 2.0, dtype=torch.bfloat16),
+        )
+        assert put_state_dict.await_count == 2
+        for call in put_state_dict.await_args_list:
+            assert call.args[0] is staging
+            assert call.args[1] == "model_state_dict"
+            assert call.kwargs == {"direct_rdma": False}
+        assert staging["scale"].data_ptr() == scale_data_ptr
+        torch.testing.assert_close(staging["scale"], torch.tensor(3.0))
+
+    asyncio.run(run())
+
+
+def test_push_staging_copies_parameters_already_in_transfer_dtype() -> None:
+    trainer = object.__new__(Trainer)
+    trainer.engine = SimpleNamespace(device=torch.device("cuda", 0))
+    trainer.model = torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+    trainer._transfer_dtype = torch.bfloat16
+
+    empty_like = torch.empty_like
+    pin_memory_requests = []
+
+    def allocate_without_pinning(*args, **kwargs):
+        pin_memory_requests.append(kwargs.get("pin_memory", False))
+        kwargs["pin_memory"] = False
+        return empty_like(*args, **kwargs)
+
+    with (
+        patch("torchtitan.rl.trainer.maybe_apply_numa_binding") as bind,
+        patch(
+            "torchtitan.rl.trainer.torch.empty_like",
+            side_effect=allocate_without_pinning,
+        ),
+    ):
+        staging = trainer._setup_push_staging_state_dict()
+
+    assert set(staging) == {"weight"}
+    assert staging["weight"].dtype == torch.bfloat16
+    assert pin_memory_requests == [True]
+    bind.assert_called_once_with(0, "cuda")
+
+
 def test_rl_trainer_accepts_core_sdc_replay_config() -> None:
     config = Trainer.Config(
         debug=DebugConfig(deterministic=True),
