@@ -129,6 +129,7 @@ def _generator():
     generator = VLLMGenerator.__new__(VLLMGenerator)
     generator._engine = _FakeEngine()
     generator._rank = 0
+    generator._weight_storage_fingerprints = None
     generator.policy_version = 7
     generator.config = SimpleNamespace(
         sampling=SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4),
@@ -173,7 +174,11 @@ def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
         generator.config.reset_kv_cache_on_weight_sync = False
 
         get_state_dict = AsyncMock(side_effect=fill_state_dict)
-        with patch.object(generator_module.ts, "get_state_dict", get_state_dict):
+        client = AsyncMock(return_value=SimpleNamespace(last_get_transport_metrics={}))
+        with (
+            patch.object(generator_module.ts, "get_state_dict", get_state_dict),
+            patch.object(generator_module.ts, "client", client),
+        ):
             await generator.prefetch_model_state_dict()
             await generator._pull_model_state_dict(3)
 
@@ -184,7 +189,8 @@ def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
             strict=False,
             direct_rdma=False,
         )
-        load_state_dict.assert_called_once_with({"weight": "fetched"}, strict=True)
+        client.assert_awaited_once_with()
+        load_state_dict.assert_called_once_with({"weight": "fetched"}, strict=False)
 
     asyncio.run(main())
 
