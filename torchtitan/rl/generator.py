@@ -1582,6 +1582,10 @@ class VLLMGenerator(Configurable):
             requester_index: Index used to namespace this generator mesh.
         """
         await ts.client(role=RankRole.REQUESTER, group=requester_index)
+        await ts.prepare_state_dict(
+            "model_state_dict",
+            self._prefetched_model_state_dict,
+        )
 
     @sl.log_trace_span("pull_model_state_dict")
     async def pull_model_state_dict(self, version: int) -> None:

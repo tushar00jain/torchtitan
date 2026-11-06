@@ -8,20 +8,16 @@ import asyncio
 import logging
 import os
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torchstore as ts
-from torch.distributed.tensor import DTensor
 from torchstore import RankRole
 
-from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.validation import validate_model_training_config
 from torchtitan.distributed import maybe_apply_numa_binding, utils as dist_utils
-from torchtitan.distributed.utils import get_local_tensor
 from torchtitan.models.base.model import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
 from torchtitan.observability import structured_logger as sl
@@ -115,8 +111,8 @@ class Trainer(Configurable):
         self._controller_state = MirroredState()
         maybe_apply_numa_binding(engine.device.index, engine.device.type)
 
-        # Only cast when the generator and training dtypes differ. A CPU
-        # staging snapshot is still required when no cast is needed.
+        # Routing stores use each requester's registered dtype. Keep the
+        # transfer dtype for clients that do not provide routed dtype staging.
         training_dtype = TORCH_DTYPE_MAP[config.training.dtype]
         gen_dtype = TORCH_DTYPE_MAP[generator_dtype] if generator_dtype else None
         self._transfer_dtype = gen_dtype if gen_dtype != training_dtype else None
@@ -138,7 +134,6 @@ class Trainer(Configurable):
         self.model = engine.model_parts[0]
 
         engine.load_checkpoint()
-        self._staging_state_dict = self._setup_staging_model_state_dict()
         self._staging_device_module = torch.get_device_module(engine.device)
         if engine.device.type == "cpu":
             self._staging_model_state_dict_stream = None
@@ -358,84 +353,42 @@ class Trainer(Configurable):
 
     @sl.log_trace_span("push_model_state_dict")
     async def push_model_state_dict(self) -> None:
-        """Publish a CPU snapshot of model weights for generators to pull."""
+        """Publish model weights for generators to pull."""
 
         model_state_dict = self.model.state_dict()
-        # Today we copy the model into reusable pinned CPU buffers before calling
-        # TorchStore. Parameter destinations use the generator dtype, so copy_()
-        # performs the cast; buffers keep their registered dtype.
-        # TODO(async-rl): add a TorchStore-owned staging API so the trainer can
-        # copy directly into the StorageVolume, eliminating the duplicate CPU
-        # snapshot while preserving this overlap and making buffer lifetime
-        # explicit.
-        staging_complete = await self._stage_model_state_dict(model_state_dict)
+        staging_ready = self._record_model_state_dict_staging_ready()
         await asyncio.to_thread(
-            self._wait_for_staging_and_put_model_state_dict,
-            staging_complete,
+            self._wait_and_put_model_state_dict,
+            model_state_dict,
+            staging_ready,
         )
 
-    @sl.log_trace_span("stage_model_state_dict")
-    async def _stage_model_state_dict(
-        self, model_state_dict: dict[str, torch.Tensor]
-    ) -> torch.Event | None:
-        """Enqueue model-state copies into pinned CPU buffers."""
+    def _record_model_state_dict_staging_ready(self) -> torch.Event | None:
+        """Record when TorchStore may safely stage the current model weights."""
         stream = self._staging_model_state_dict_stream
-        stream_context = (
-            self._staging_device_module.stream(stream)
-            if stream is not None
-            else nullcontext()
-        )
-        staging_complete: torch.Event | None = None
-        with stream_context:
-            for name, destination in self._staging_state_dict.items():
-                source = model_state_dict[name]
-                get_local_tensor(destination).copy_(
-                    get_local_tensor(source), non_blocking=stream is not None
-                )
-            if stream is not None:
-                staging_complete = self._staging_device_module.Event()
-                staging_complete.record(stream)
+        if stream is None:
+            return None
+        with self._staging_device_module.stream(stream):
+            staging_ready = self._staging_device_module.Event()
+            staging_ready.record(stream)
+        return staging_ready
 
-        return staging_complete
-
-    def _wait_for_staging_and_put_model_state_dict(
-        self, staging_complete: torch.Event | None
+    def _wait_and_put_model_state_dict(
+        self,
+        model_state_dict: dict[str, torch.Tensor],
+        staging_ready: torch.Event | None,
     ) -> None:
-        """Wait for staging and publish without blocking the actor event loop."""
-        if staging_complete is not None:
-            staging_complete.synchronize()
+        """Wait for model readiness and publish off the actor event loop."""
+        if staging_ready is not None:
+            staging_ready.synchronize()
         asyncio.run(
             ts.put_state_dict(
-                self._staging_state_dict,
+                model_state_dict,
                 "model_state_dict",
                 direct_rdma=False,
+                transfer_dtype=self._transfer_dtype,
             )
         )
-
-    def _setup_staging_model_state_dict(self) -> dict[str, torch.Tensor]:
-        """Allocate a final-dtype pinned CPU mirror of the model state dict."""
-        buffer_names = {canonical_fqn(name) for name, _ in self.model.named_buffers()}
-        model_state_dict = self.model.state_dict()
-        staging_state_dict = {}
-        for name, tensor in model_state_dict.items():
-            dtype = (
-                self._transfer_dtype
-                if self._transfer_dtype is not None and name not in buffer_names
-                else tensor.dtype
-            )
-            staging_tensor = torch.empty_like(
-                tensor,
-                dtype=dtype,
-                device="cpu",
-                pin_memory=not isinstance(tensor, DTensor),
-            )
-            if isinstance(staging_tensor, DTensor):
-                # DTensor does not support pin_memory(), so pin its local shard.
-                staging_tensor._local_tensor = torch.empty_like(
-                    get_local_tensor(staging_tensor), pin_memory=True
-                )
-            staging_state_dict[name] = staging_tensor
-        return staging_state_dict
 
     async def initialize_torchstore_client(self) -> None:
         """Initialize this process as a TorchStore routing publisher."""
