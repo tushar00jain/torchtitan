@@ -22,7 +22,6 @@ import spmd_types as spmd
 import torch
 import torch.distributed as dist
 from torch.distributed._composable.fsdp import FSDPModule
-from torch.distributed._state_dict_utils import _create_cpu_state_dict
 from torch.distributed.tensor import DTensor, Replicate
 
 # Registers the "loss" local-compile region. The generator shares the trainer's
@@ -415,8 +414,8 @@ class VLLMModelWrapper(Module):
         # NUMA node local to this rank's GPU.
         maybe_apply_numa_binding(torch.cuda.current_device(), "cuda")
         with torch.device("cpu"):
-            self._prefetched_model_state_dict = _create_cpu_state_dict(
-                self.model.state_dict(), pin_memory=True
+            self._prefetched_model_state_dict = ts.create_pinned_state_dict(
+                self.model.state_dict()
             )
 
         # Unshard the model here so vLLM performs its GPU memory profiling
