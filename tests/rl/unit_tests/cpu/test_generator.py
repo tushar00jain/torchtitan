@@ -21,7 +21,6 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import torch
-
 import torchtitan.rl.generator.generator as generator_module
 import torchtitan.rl.generator.vllm.engine as vllm_engine_module
 from torchstore import RankRole
@@ -148,11 +147,20 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
 def test_initialize_torchstore_client_uses_requester_index():
     async def main():
         generator = Generator.__new__(Generator)
+        generator._prefetched_model_state_dict = {"weight": object()}
         client = AsyncMock()
-        with patch.object(generator_module.ts, "client", client):
+        prepare_state_dict = AsyncMock()
+        with (
+            patch.object(generator_module.ts, "client", client),
+            patch.object(generator_module.ts, "prepare_state_dict", prepare_state_dict),
+        ):
             await generator.initialize_torchstore_client(requester_index=3)
 
         client.assert_awaited_once_with(role=RankRole.REQUESTER, group=3)
+        prepare_state_dict.assert_awaited_once_with(
+            "model_state_dict",
+            generator._prefetched_model_state_dict,
+        )
         assert generator._torchstore_loop is asyncio.get_running_loop()
 
     asyncio.run(main())
