@@ -9,7 +9,7 @@ initial weights, and loads model state dicts into it. Shared by every engine's m
 wrapper; the wrappers replace the attention layers before the build."""
 
 import logging
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Set
 from typing import Any
 
 import spmd_types as spmd
@@ -40,6 +40,7 @@ from torchtitan.models.common.moe.token_dispatcher import (
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 from torchtitan.rl.generator.engine import ModelStateDictLoadMode
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+from torchtitan.rl.model_state_dict_transport import shard_layout, TensorShard
 from torchtitan.tools.utils import set_default_dtype
 
 logger = logging.getLogger(__name__)
@@ -477,16 +478,22 @@ class ModelStateDictLoader:
         self._fsdp_load_groups, self._buffer_keys = _fsdp_load_groups(
             model, frozen_param_keys=frozen_param_keys
         )
-        if model_state_dict_load_mode == "gpu_fetch":
-            # gpu_fetch writes into the sharded parameter itself, not a quantized
-            # parameter's high-precision _tensor.
-            for _, trainable_params, _ in self._fsdp_load_groups:
-                for key, fsdp_param in trainable_params:
-                    if isinstance(fsdp_param._sharded_param_data, _ShardedFSDPTensor):
-                        raise ValueError(
-                            "model_state_dict_load_mode='gpu_fetch' does not support "
-                            f"quantized parameters ({key})"
-                        )
+        self._gpu_fetch_has_quantized_params = (
+            model_state_dict_load_mode == "gpu_fetch"
+            and any(
+                isinstance(fsdp_param._sharded_param_data, _ShardedFSDPTensor)
+                for _, trainable_params, _ in self._fsdp_load_groups
+                for _, fsdp_param in trainable_params
+            )
+        )
+        trainable_state_dict = {
+            key: value
+            for key, value in model.state_dict().items()
+            if canonical_fqn(key) not in frozen_param_keys
+        }
+        self.model_state_dict_layout: dict[str, TensorShard] = shard_layout(
+            trainable_state_dict
+        )
 
         self.prefetched_model_state_dict: dict[str, torch.Tensor] | None = None
         """The pinned CPU buffers a model state dict is prefetched into, and loaded from
@@ -498,11 +505,6 @@ class ModelStateDictLoader:
             # No buffers for the frozen parameters: they would pin a second
             # copy of them in host memory (~100 GB per GPU for an 816B model on 16
             # GPUs) that no load fills.
-            trainable_state_dict = {
-                key: value
-                for key, value in model.state_dict().items()
-                if canonical_fqn(key) not in frozen_param_keys
-            }
             with torch.device("cpu"):
                 self.prefetched_model_state_dict = _create_cpu_state_dict(
                     trainable_state_dict, pin_memory=True
@@ -512,7 +514,13 @@ class ModelStateDictLoader:
             if isinstance(module, FSDPModule):
                 _unshard_and_free_sharded_params(module)
 
-    def load(self, fetch: Callable[[dict[str, torch.Tensor]], Iterable[str]]) -> None:
+    def load(
+        self,
+        fetch: Callable[[dict[str, torch.Tensor]], Iterable[str]],
+        *,
+        keys: Set[str] | None = None,
+        local_storage: bool = False,
+    ) -> None:
         """Fetch new weights into the model, allocating one FSDP group's sharded buffers at a time.
 
         Each group is allocated, filled by `fetch`, then unsharded and freed:
@@ -544,8 +552,16 @@ class ModelStateDictLoader:
                 fetch writing outside the current stream (e.g. RDMA) must first wait
                 for queued device work, and must finish writing before it returns.
         """
+        if self._gpu_fetch_has_quantized_params and not local_storage:
+            raise ValueError(
+                "model_state_dict_load_mode='gpu_fetch' requires "
+                "ModelStateDictTransport for quantized parameters"
+            )
+
         error = None
         for module, trainable_params, frozen_params in self._fsdp_load_groups:
+            if keys is not None and keys.isdisjoint(key for key, _ in trainable_params):
+                continue
             # unshard() is a no-op while the group is unsharded. Resharding registers
             # the sharded parameters and keeps the unsharded storage CUDA graphs read.
             _reshard(module)
@@ -557,7 +573,11 @@ class ModelStateDictLoader:
                     # The trainer sends each parameter in the dtype the generator
                     # holds it in, so fetch fills the sharded parameters in place.
                     params = {
-                        key: fsdp_param.sharded_param
+                        key: (
+                            _writable_sharded_param_storage(fsdp_param)
+                            if local_storage
+                            else fsdp_param.sharded_param
+                        )
                         for key, fsdp_param in trainable_params
                     }
                     # An unfilled parameter would load its just-reallocated,
@@ -575,8 +595,16 @@ class ModelStateDictLoader:
             raise error
         # Buffers load after every FSDP collective, so a failure here cannot hang
         # peers. A fetch that skips unpublished keys (gpu_fetch) leaves them as is.
-        if self._buffer_keys:
-            fetch({key: self._model.get_buffer(key) for key in self._buffer_keys})
+        buffer_keys = (
+            self._buffer_keys if keys is None else keys.intersection(self._buffer_keys)
+        )
+        if buffer_keys:
+            fetch({key: self._model.get_buffer(key) for key in buffer_keys})
+
+
+def _writable_sharded_param_storage(fsdp_param: Any) -> torch.Tensor:
+    storage = fsdp_param._sharded_local_tensor
+    return storage._tensor if isinstance(storage, _ShardedFSDPTensor) else storage
 
 
 def _sharded_param_storages(module: FSDPModule) -> Iterator[torch.Tensor]:

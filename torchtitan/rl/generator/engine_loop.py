@@ -14,7 +14,7 @@ import enum
 import gc
 import logging
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Set
 from dataclasses import dataclass, field
 from typing import TypeVar
 
@@ -150,6 +150,8 @@ class EngineLoop:
     ):
         self._engine: GenerationEngine | None = engine
         self._fetch_model_state_dict = fetch_model_state_dict
+        self._model_state_dict_keys: Set[str] | None = None
+        self._model_state_dict_local_storage = False
         self._event_loop = event_loop
         self._request_dispatcher = request_dispatcher
         self._rank = rank
@@ -215,6 +217,18 @@ class EngineLoop:
             ModelStateDictLoadMessage(version=version, drain=drain, reply=reply)
         )
         await asyncio.wrap_future(reply)
+
+    def set_model_state_dict_fetch(
+        self,
+        fetch: Callable[[dict[str, torch.Tensor]], Iterable[str]],
+        *,
+        keys: Set[str] | None,
+        local_storage: bool,
+    ) -> None:
+        """Set the callback used by subsequent model state dict loads."""
+        self._fetch_model_state_dict = fetch
+        self._model_state_dict_keys = keys
+        self._model_state_dict_local_storage = local_storage
 
     def release_groups(self, group_ids: list[int]) -> None:
         """RANK 0: drop the pinned cache salts of finished rollout groups."""
@@ -540,7 +554,14 @@ class EngineLoop:
         """
         error: Exception | None = None
         try:
-            self._engine.load_model_state_dict(self._fetch_model_state_dict)
+            if self._model_state_dict_keys is None:
+                self._engine.load_model_state_dict(self._fetch_model_state_dict)
+            else:
+                self._engine.load_model_state_dict(
+                    self._fetch_model_state_dict,
+                    keys=self._model_state_dict_keys,
+                    local_storage=self._model_state_dict_local_storage,
+                )
         except Exception as e:
             # Log now: peers may be stuck in a collective until it times out.
             logger.exception("Model state dict load failed")

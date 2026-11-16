@@ -9,14 +9,17 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Set
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 
 import torch
 
 from torchtitan.config import Configurable
 from torchtitan.rl.generator.types import EngineRequest, FinishedRequest
+
+if TYPE_CHECKING:
+    from torchtitan.rl.model_state_dict_transport import TensorShard
 
 
 ModelStateDictLoadMode = Literal["cpu_prefetch", "gpu_fetch"]
@@ -82,6 +85,11 @@ class GenerationEngine(Configurable, abc.ABC):
         a model state dict load. Safe to fill from any thread while no load runs. None with
         ``model_state_dict_load_mode="gpu_fetch"``."""
 
+    @property
+    @abc.abstractmethod
+    def model_state_dict_layout(self) -> dict[str, TensorShard]:
+        """The sharded weights and buffers a model state dict load fills."""
+
     @abc.abstractmethod
     def add_requests(
         self, requests: list[EngineRequest]
@@ -99,7 +107,11 @@ class GenerationEngine(Configurable, abc.ABC):
 
     @abc.abstractmethod
     def load_model_state_dict(
-        self, fetch: Callable[[dict[str, torch.Tensor]], Iterable[str]]
+        self,
+        fetch: Callable[[dict[str, torch.Tensor]], Iterable[str]],
+        *,
+        keys: Set[str] | None = None,
+        local_storage: bool = False,
     ) -> None:
         """Load a model state dict by having ``fetch`` fill the model's weights in place, and
         reset the KV cache when configured.

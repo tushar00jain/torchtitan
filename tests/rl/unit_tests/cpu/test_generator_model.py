@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -13,12 +14,14 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+from torch.distributed.tensor import DTensor
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
 
 from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 from torchtitan.rl.generator import model as generator_model
 from torchtitan.rl.generator.engine import ModelStateDictLoadMode
 from torchtitan.rl.generator.model import ModelStateDictLoader
@@ -68,6 +71,16 @@ def _build_loader(
             frozen_param_keys=frozen,
             hf_assets_path="/hf",
         )
+
+
+def test_direct_fetch_uses_quantized_high_precision_storage() -> None:
+    class _QuantizedShard(_ShardedFSDPTensor):
+        pass
+
+    high_precision = torch.zeros(4)
+    fsdp_param = SimpleNamespace(_sharded_local_tensor=_QuantizedShard(high_precision))
+
+    assert generator_model._writable_sharded_param_storage(fsdp_param) is high_precision
 
 
 @pytest.mark.parametrize("loads_checkpoint", [False, True])
@@ -219,6 +232,51 @@ def test_load_model_state_dict_fetches_params_in_their_own_dtype(tmp_path) -> No
         assert fetched_dtypes["A_log"] == torch.float32
         assert model.A_log.equal(new_state_dict["A_log"].full_tensor())
         assert model.layer.weight.equal(new_state_dict["layer.weight"].full_tensor())
+    finally:
+        dist.destroy_process_group()
+
+
+def test_delta_load_fetches_complete_changed_group(tmp_path) -> None:
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
+    )
+    try:
+        model = nn.Module()
+        model.layers = nn.ModuleList(nn.Linear(4, 4) for _ in range(2))
+        model.register_buffer("scale", torch.zeros(4))
+        mesh = init_device_mesh("cpu", (1,))
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, reshard_after_forward=False)
+        fully_shard(model, mesh=mesh, reshard_after_forward=False)
+        model.set_keep_unsharded_storage(True)
+        initial = {
+            key: value.detach().clone() for key, value in model.state_dict().items()
+        }
+        updated = {key: value + 1 for key, value in initial.items()}
+        loader = _build_loader(model, loads_checkpoint=False)
+        fetched = []
+
+        def fetch(state_dict: dict[str, torch.Tensor]) -> list[str]:
+            fetched.append(set(state_dict))
+            with torch.no_grad():
+                for key, tensor in state_dict.items():
+                    source = updated[key]
+                    tensor.copy_(
+                        source.to_local() if isinstance(source, DTensor) else source
+                    )
+            return list(state_dict)
+
+        loader.load(
+            fetch,
+            keys={"layers.1.weight"},
+            local_storage=True,
+        )
+
+        assert fetched == [{"layers.1.weight", "layers.1.bias"}]
+        for name, param in model.named_parameters():
+            expected = updated if name.startswith("layers.1.") else initial
+            assert param.equal(expected[name].full_tensor()), name
+        assert model.scale.equal(initial["scale"])
     finally:
         dist.destroy_process_group()
 

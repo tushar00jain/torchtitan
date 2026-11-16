@@ -1,7 +1,7 @@
 # Model state dict transport
 
 `ModelStateDictTransport` (`model_state_dict_transport.py`) moves the trainer's
-model state dict into the generators' prefetched model state dicts with
+model state dict into generator CPU or GPU memory with
 one-sided RDMA reads over a `torch.distributed._transport` backend
 (`backend="nixl"`, the default, or `"mooncake"`). It is the default
 `Controller.Config.model_state_dict_transport`; select Mooncake with:
@@ -21,9 +21,8 @@ push transfers it in full; later pushes compare the next staged state against
 it and transfer only changed tensor ranges. The optimizer can step while
 generators read, and the trainer keeps no persistent GPU copy.
 
-`None` uses TorchStore instead, which is still needed for
-`model_state_dict_load_mode="gpu_fetch"`. TODO: delete the TorchStore path once
-this one covers `gpu_fetch`.
+`None` keeps TorchStore. TODO: delete the TorchStore path once this transport has
+rolled out.
 
 Mooncake needs `mooncake-transfer-engine-cuda13==0.3.14` (installed by
 `scripts/install_rl_env.sh`) and a PyTorch nightly from 2026-11-10 or later
@@ -87,22 +86,23 @@ does not cover every element of a generator shard, or on `Partial` and uneven
    reports its ranks' `shard_layout`s, which must match
    (`shared_rank_layouts`); each trainer rank allocates and registers one staging
    tensor for full sync, or a baseline and a current-state staging tensor for
-   delta sync (`register_trainer_source`); every generator rank registers its
-   persistent prefetch buffers, connects to every trainer rank and plans its reads
-   (`connect_generator`).
+   delta sync (`register_trainer_source`); every CPU-prefetch generator rank
+   registers its persistent prefetch buffers. A GPU-fetch rank registers each
+   temporary FSDP-group destination during loading.
 2. Push: full sync overwrites its staging tensor. For delta sync, the first push
    fills the baseline. Later pushes fill the current-state tensor, then compare its
    packed-piece ranges with the baseline after the device-to-host copies finish.
    Changed ranges are copied into the baseline for the next push. Staging has no
    collectives. The trainer push endpoint returns the changed ranges as ordinary
    control-plane metadata.
-3. Pull: full sync reads every piece on every pull. Delta sync reads the baseline
-   in full on its first pull, then reads only changed pieces into the persistent
-   prefetch buffers. Each generator rank waits for its reads and raises after
-   `read_timeout_s` (600 s). A timeout leaves reads and prefetch buffers undefined;
-   restart the job.
-4. Load: the generator copies its weights from the prefetch buffers, unpacking
-   packed keys (`copy_prefetched_`).
+3. Pull: CPU prefetch reads every piece for full sync, or only changed pieces for
+   delta sync. GPU fetch uses the changed ranges to skip unchanged FSDP groups and
+   reads each selected group directly into its GPU shards. Packed pieces use a
+   temporary contiguous GPU buffer and are unpacked before the existing FSDP
+   all-gather and quantization. Each generator rank raises after `read_timeout_s`
+   (600 s).
+4. Load: CPU prefetch copies weights from its persistent buffers. GPU fetch uses
+   the existing FSDP all-gather and quantization after each direct read.
 
 The controller remains the only weight-sync coordinator and policy-version
 authority. It forwards the changed ranges without interpreting them and finishes

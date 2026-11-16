@@ -59,6 +59,7 @@ class _FakeTransport:
         self.url = str(next(self._urls)).encode()
         self.connected = set()
         self.registered = []
+        self.unregistered = []
         self.reads = []
 
     def register_memory(self, tensor):
@@ -72,11 +73,20 @@ class _FakeTransport:
     def connect(self, url):
         self.connected.add(url)
 
-    def read(self, local, remote, *, async_op):
+    def read(self, local, remote, *, async_op=False, timeout=None):
         assert remote.url in self.connected
         assert local.shape == remote.data.shape
         self.reads.append((local, remote))
         local.copy_(remote.data)
+        return _FakeWork() if async_op else 0
+
+    def unregister_memory(self, memory):
+        self.unregistered.append(memory)
+
+
+class _FakeWork:
+    def wait(self):
+        return True
 
 
 async def _wait_all(works, *, timeout):
@@ -398,6 +408,7 @@ def test_delta_reads_only_changed_transfer_ranges(monkeypatch):
     metadata = trainer.finish_stage()
 
     changed_ranges = set(metadata.changed_ranges)
+    assert metadata.changed_keys == {"changed", "many_changes"}
     changed_by_key = {
         key: [transfer_range in changed_ranges for transfer_range in ranges]
         for key, ranges in ranges_by_key.items()
@@ -423,6 +434,77 @@ def test_delta_reads_only_changed_transfer_ranges(monkeypatch):
     asyncio.run(generator.read((metadata,), full=False))
     for key in next_target:
         torch.testing.assert_close(prefetched[key], next_target[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sync_mode", ["full", "delta"])
+def test_gpu_fetch_reads_selected_keys(monkeypatch, sync_mode):
+    config = ModelStateDictTransport.Config(
+        backend="nixl", sync_mode=sync_mode, read_timeout_s=5.0
+    )
+    monkeypatch.setattr(m, "new_transport", lambda backend: _FakeTransport())
+    initial = {
+        "unchanged": torch.arange(8, dtype=torch.bfloat16),
+        "changed": torch.arange(8, dtype=torch.bfloat16) + 20,
+    }
+    layout = m.shard_layout(initial)
+    trainer = ModelStateDictTransport(config)
+    source = trainer.register_trainer_source(
+        initial,
+        generator_rank_layouts=[layout],
+        transfer_dtype=None,
+        preserve_dtype_keys=frozenset(),
+    )
+    trainer.stage(initial)
+    trainer.finish_stage()
+
+    generator = ModelStateDictTransport(config)
+    generator.connect_generator_gpu(layout, sources=[source], rank=0, generator_index=0)
+
+    target = {key: value.clone() for key, value in initial.items()}
+    target["changed"][0] += 1
+    trainer.stage(target)
+    metadata = trainer.finish_stage()
+    expected_keys = initial.keys() if sync_mode == "full" else {"changed"}
+    assert generator.changed_keys((metadata,), full=False) == expected_keys
+
+    destination = {key: torch.zeros_like(target[key]) for key in expected_keys}
+    assert generator.read_into(destination) == destination.keys()
+    for key in expected_keys:
+        torch.testing.assert_close(destination[key], target[key], rtol=0, atol=0)
+    assert len(generator._transport.unregistered) == len(expected_keys)
+
+
+def test_gpu_fetch_unpacks_staged_pieces(monkeypatch):
+    config = ModelStateDictTransport.Config(backend="nixl", read_timeout_s=5.0)
+    monkeypatch.setattr(m, "new_transport", lambda backend: _FakeTransport())
+    full = torch.arange(8 * 6, dtype=torch.float32).reshape(8, 6)
+    boxes = {}
+    monkeypatch.setattr(
+        m, "_global_offset_and_local_shape", lambda tensor: boxes[id(tensor)]
+    )
+    layout = {"w": m.TensorShard((0, 0), (8, 6), torch.float32)}
+    sources = []
+    for box in _boxes(full.shape, 2, 1):
+        local = full[_index(*box)]
+        boxes[id(local)] = box
+        trainer = ModelStateDictTransport(config)
+        sources.append(
+            trainer.register_trainer_source(
+                {"w": local},
+                generator_rank_layouts=[layout],
+                transfer_dtype=None,
+                preserve_dtype_keys=frozenset(),
+            )
+        )
+        trainer.stage({"w": local})
+        trainer.finish_stage()
+
+    generator = ModelStateDictTransport(config)
+    generator.connect_generator_gpu(layout, sources=sources, rank=0, generator_index=0)
+    assert set(generator._gpu_packed) == {"w"}
+    destination = {"w": torch.zeros_like(full)}
+    generator.read_into(destination)
+    torch.testing.assert_close(destination["w"], full, rtol=0, atol=0)
 
 
 def test_shared_rank_layouts():
