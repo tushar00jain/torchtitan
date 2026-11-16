@@ -6,7 +6,8 @@ This design is inspired by the windowed FIFO rollout scheduling described in Sec
 
 - `P`: prompt groups per train step (`num_prompts_per_train_step`).
 - `S`: target steady-state offpolicy steps (`target_offpolicy_steps`).
-- `B`: active buffer size in prompt groups (`max_active_rollout_groups`), computed as `B = (S + 1) * P`.
+- `R`: extra rollout groups used as failure and straggler headroom (`num_rollout_group_headroom`).
+- `B`: active buffer size in prompt groups (`max_active_rollout_groups`), computed as `B = (S + 1) * P + R`.
 - `windowed_fifo_batches`: FIFO look-ahead window in train batches; `None` means no window.
 - `W`: that window in group ids (`window_size`), computed as `W = windowed_fifo_batches * P`.
 
@@ -14,9 +15,22 @@ This design is inspired by the windowed FIFO rollout scheduling described in Sec
 
 With `windowed_fifo_batches = None` the batcher takes the oldest finalized group anywhere in the buffer. It does not wait for an unfinished older group while a younger finished group is ready.
 
-There is no maximum offpolicy age. A slow group is trained when it lands, however old. The share of samples older than `S` is reported in `train_batch/pct_samples_over_target_age` and logged with a warning; they are never dropped.
+After `P` trainable groups form a batch, the buffer retires up to `R` oldest
+unselected groups. Their active slots remain charged until the generators pull
+the next policy, when `P + R` fresh slots become available. The other `S * P`
+groups remain in flight, preserving the intentional off-policy pipeline.
 
-The mean offpolicy age is still about `S`. By Little's law, mean age = groups in the buffer / groups consumed per step: the buffer holds `B = (S + 1) * P` groups, `P` of them are the batch being trained, and the trainer consumes `P` per step, so a group waits about `S` steps whatever the order.
+There is no maximum offpolicy age. With `R = 0`, a slow trainable group is
+trained when it lands, however old. With headroom, an old group may instead be
+one of the `R` groups retired when a batch becomes ready. The share of trained
+samples older than `S` is reported in
+`train_batch/pct_samples_over_target_age` and logged with a warning.
+
+With `R = 0`, the mean offpolicy age is about `S`. By Little's law, the
+buffer holds `(S + 1) * P` groups, `P` of them are the batch being trained,
+and the trainer consumes `P` per step, so a group waits about `S` steps. With
+headroom, each step also retires up to `R` groups, so the retained off-policy
+pipeline remains `S * P` groups instead of growing by `R` every step.
 
 ## The straggler problem
 
@@ -44,7 +58,7 @@ W = windowed_fifo_batches * P    (None when windowed_fifo_batches is None)
 `windowed_fifo_batches = 1` is FIFO by batch: at most `P - 1` younger group ids can pass a stuck head. Increasing `windowed_fifo_batches` exposes more younger groups to the scheduler without increasing `B`.
 
 ```text
-P = 8, S = 3 (B = 32)    W       max offpolicy steps
+P = 8, S = 3, R = 0 (B = 32)    W       max offpolicy steps
 windowed_fifo_batches = None    none    unbounded
 windowed_fifo_batches = 1       8       4
 windowed_fifo_batches = 3       24      6

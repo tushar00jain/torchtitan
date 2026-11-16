@@ -137,6 +137,12 @@ from torchtitan.tools.garbage_collector import GarbageCollector
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class _QueuedTrainerStep:
+    batch: TrainerStepBatch
+    headroom_group_ids: list[int]
+
+
 @dataclass(kw_only=True, slots=True)
 class ValidationConfig:
     """Held-out validation: how many prompts each validation has (`steps`) and when validations run.
@@ -199,11 +205,20 @@ class AsyncLoopConfig(Configurable.Config):
 
     target_offpolicy_steps: int = 3
     """Target steady-state offpolicy steps used to set the active buffer size to
-    `(S + 1) * P`. Observed offpolicy steps are not guaranteed to equal this
-    target: when rollout generation is the bottleneck, the buffer may not fill
-    and observed offpolicy steps will be lower. A finite `windowed_fifo_batches` bounds
-    how far a slow group may exceed this target; None leaves it unbounded. See
+    `(S + 1) * P` before rollout-group headroom. Observed offpolicy steps are not
+    guaranteed to equal this target: when rollout generation is the bottleneck,
+    the buffer may not fill and observed offpolicy steps will be lower. A finite
+    `windowed_fifo_batches` bounds how far a slow group may exceed this target;
+    None leaves it unbounded. See
     ``torchtitan/rl/controller/WINDOWED_FIFO.md`` for details."""
+
+    num_rollout_group_headroom: int = 0
+    """Extra active rollout groups used as failure and straggler headroom.
+
+    Once a training batch has enough groups, the oldest remaining groups up to
+    this count are retired. Their slots are replaced with fresh work after the
+    next policy pull, while the intentional off-policy pipeline stays intact.
+    """
 
     windowed_fifo_batches: int | None = None
     """FIFO look-ahead window in train batches.
@@ -233,6 +248,11 @@ class AsyncLoopConfig(Configurable.Config):
             raise ValueError(
                 f"target_offpolicy_steps must be >= 0, got {self.target_offpolicy_steps}"
             )
+        if self.num_rollout_group_headroom < 0:
+            raise ValueError(
+                "num_rollout_group_headroom must be >= 0, got "
+                f"{self.num_rollout_group_headroom}"
+            )
         if self.windowed_fifo_batches is not None and self.windowed_fifo_batches < 1:
             raise ValueError(
                 f"windowed_fifo_batches must be None or >= 1, got {self.windowed_fifo_batches}"
@@ -240,7 +260,10 @@ class AsyncLoopConfig(Configurable.Config):
 
     @property
     def max_active_rollout_groups(self) -> int:
-        return (self.target_offpolicy_steps + 1) * self.num_prompts_per_train_step
+        return (
+            (self.target_offpolicy_steps + 1) * self.num_prompts_per_train_step
+            + self.num_rollout_group_headroom
+        )
 
     @property
     def window_size(self) -> int | None:
@@ -254,7 +277,8 @@ class AsyncLoopConfig(Configurable.Config):
         """Return the worst case consume-time offpolicy bound, or None without a window.
 
         For active buffer size `B`, window size `W`, and prompts per train step
-        `P`, the bound is `(B + W - 2) // P`, which is `S + windowed_fifo_batches`.
+        `P`, the conservative bound is `(B + W - 2) // P`. Without headroom,
+        this is `S + windowed_fifo_batches`.
         """
         if self.window_size is None:
             return None
@@ -916,7 +940,7 @@ class Controller(Configurable):
         )
 
         # training_batch_queue
-        training_batch_queue: asyncio.Queue[TrainerStepBatch | None] = asyncio.Queue(
+        training_batch_queue: asyncio.Queue[_QueuedTrainerStep | None] = asyncio.Queue(
             maxsize=1
         )
 
@@ -1159,7 +1183,7 @@ class Controller(Configurable):
     async def _batcher_loop(
         self,
         *,
-        training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]",
+        training_batch_queue: "asyncio.Queue[_QueuedTrainerStep | None]",
     ) -> None:
         """Send finalized groups to the batcher actor and queue each training batch it returns.
 
@@ -1190,13 +1214,21 @@ class Controller(Configurable):
                     1, reason="untrainable_group"
                 )
             if maybe_training_batch is not None:
-                await training_batch_queue.put(maybe_training_batch)
+                headroom_group_ids = await self._group_buffer.retire_oldest(
+                    self.config.async_loop.num_rollout_group_headroom
+                )
+                await training_batch_queue.put(
+                    _QueuedTrainerStep(
+                        batch=maybe_training_batch,
+                        headroom_group_ids=headroom_group_ids,
+                    )
+                )
         await training_batch_queue.put(None)
         # TODO(async-rl): if finite datasets are supported, drain a final partial batch here.
 
     async def _trainer_loop(
         self,
-        training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]",
+        training_batch_queue: "asyncio.Queue[_QueuedTrainerStep | None]",
         *,
         num_training_steps: int,
     ) -> None:
@@ -1247,11 +1279,13 @@ class Controller(Configurable):
                     sl.log_trace_span("wait_for_training_batch"),
                     step_timer.record("timing/step/wait_for_training_batch"),
                 ):
-                    packed = await training_batch_queue.get()
+                    queued_step = await training_batch_queue.get()
 
-                if packed is None:
+                if queued_step is None:
                     logger.info("Batcher closed and drained; stopping training")
                     break
+                packed = queued_step.batch
+                headroom_group_ids = queued_step.headroom_group_ids
 
                 # Policy age is computed HERE, at consumption time, against the live trainer version, so it is
                 # faithful to what this step trains on -- not the version when the batch was packed.
@@ -1324,7 +1358,9 @@ class Controller(Configurable):
                     # before the corresponding optimizer step is durable. The
                     # batcher includes every consumed group ID here, including
                     # metric-only zero-std groups excluded from model inputs.
-                    self._rollouter.commit_training_sample_ids(packed.group_ids)
+                    self._rollouter.commit_training_sample_ids(
+                        [*packed.group_ids, *headroom_group_ids]
+                    )
                     optimizer_result = self._get_rank_0_value(
                         await self.trainer.all_ranks.optim_step.call(
                             resume_state=self._rollouter.state_dict(),
@@ -1346,7 +1382,9 @@ class Controller(Configurable):
                 push_task = asyncio.create_task(self._push_model_state_dict())
                 pull_task = asyncio.create_task(
                     self._pull_model_state_dict_and_release_groups(
-                        optimizer_result.policy_version, after=push_task
+                        optimizer_result.policy_version,
+                        num_headroom_groups=len(headroom_group_ids),
+                        after=push_task,
                     )
                 )
 
@@ -1368,6 +1406,10 @@ class Controller(Configurable):
                             for key, value in optimizer_result.metrics.items()
                         ],
                         *self._group_buffer.metrics(),
+                        m.Metric(
+                            "rollout_buffer/num_groups_retired_for_headroom",
+                            m.Sum(float(len(headroom_group_ids))),
+                        ),
                         *time_metrics,
                         *policy_age_panel,
                         # Background push/pull work time; the trainer's wait for it is timing/step/blocking_*.
@@ -1408,7 +1450,11 @@ class Controller(Configurable):
             return time.perf_counter() - start
 
     async def _pull_model_state_dict_and_release_groups(
-        self, version: int, *, after: asyncio.Task[float]
+        self,
+        version: int,
+        *,
+        num_headroom_groups: int,
+        after: asyncio.Task[float],
     ) -> float:
         """Once the push ``after`` lands, load policy ``version`` into every generator, then admit
         the next rollout groups; returns the pull's wall time in seconds."""
@@ -1427,4 +1473,8 @@ class Controller(Configurable):
         await self._group_buffer.release_active_groups(
             self.config.async_loop.num_prompts_per_train_step, reason="trained"
         )
+        if num_headroom_groups:
+            await self._group_buffer.release_active_groups(
+                num_headroom_groups, reason="headroom"
+            )
         return pull_s
