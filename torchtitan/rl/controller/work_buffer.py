@@ -159,7 +159,7 @@ class RolloutGroupWorkBuffer(Configurable):
         async with self._condition:
             work = self._work_by_group_id.get(rollout_group.group_id)
             if work is None:
-                # run()'s shutdown called close(); drop the result.
+                # Shutdown or headroom retirement removed the work; drop the result.
                 return
             work.rollout_group = rollout_group
             work.state = _RolloutGroupWorkState.FINALIZED
@@ -204,6 +204,28 @@ class RolloutGroupWorkBuffer(Configurable):
                         self._condition.notify_all()
                         return work.rollout_group
                 await self._condition.wait()  # nothing finalized inside the window -> stall
+
+    async def retire_oldest(self, count: int) -> list[int]:
+        """Remove up to ``count`` oldest unselected groups without freeing their slots.
+
+        The caller releases these active slots after the next policy pull, together
+        with the groups selected for training. Claimed groups may still finish, but
+        ``finalize_work`` drops their late results because their entries are gone.
+        """
+        if count < 0:
+            raise ValueError(f"count must be non-negative, got {count}")
+        if count == 0:
+            return []
+        async with self._condition:
+            group_ids = list(self._work_by_group_id)[:count]
+            for group_id in group_ids:
+                del self._work_by_group_id[group_id]
+            if group_ids:
+                sl.log_trace_scalar(
+                    {"rollout_buffer/retired/headroom": float(len(group_ids))}
+                )
+                self._condition.notify_all()
+            return group_ids
 
     async def release_active_groups(self, count: int, *, reason: str) -> None:
         """Free active slots: the trainer releases trained slots after its model state dict pull; the batcher

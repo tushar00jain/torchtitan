@@ -85,6 +85,7 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
             target_offpolicy_steps=1,
             max_offpolicy_steps=None,
             num_prompts_per_train_step=5,
+            num_rollout_group_headroom=0,
             validation=ValidationConfig(),
         )
     )
@@ -113,9 +114,12 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
     async def sync_log_step(step):
         pass
 
+    controller.committed_sample_ids = []
     controller._rollouter = SimpleNamespace(
         sync_log_step=sync_log_step,
-        commit_training_sample_ids=lambda group_ids: None,
+        commit_training_sample_ids=lambda group_ids: controller.committed_sample_ids.append(
+            group_ids
+        ),
         state_dict=lambda: {},
     )
     controller._group_buffer = SimpleNamespace(
@@ -130,17 +134,25 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
     return controller
 
 
-def _batch_queue(num_batches: int) -> asyncio.Queue:
+def _batch_queue(
+    num_batches: int,
+    *,
+    group_ids: list[int] | None = None,
+    headroom_group_ids: list[int] | None = None,
+) -> asyncio.Queue:
     queue: asyncio.Queue = asyncio.Queue()
     for _ in range(num_batches):
         queue.put_nowait(
             SimpleNamespace(
-                microbatch_groups=[],
-                global_loss_token_counts=[1],
-                global_routing_token_counts=None,
-                group_ids=[],
-                min_policy_versions=[0],
-                metrics=[],
+                batch=SimpleNamespace(
+                    microbatch_groups=[],
+                    global_loss_token_counts=[1],
+                    global_routing_token_counts=None,
+                    group_ids=group_ids or [],
+                    min_policy_versions=[0],
+                    metrics=[],
+                ),
+                headroom_group_ids=headroom_group_ids or [],
             )
         )
     return queue
@@ -176,6 +188,21 @@ def test_push_then_pull_then_release_after_each_optimizer_step() -> None:
         "pull 2",
         "release 5 trained",
     ]
+
+
+def test_headroom_groups_commit_and_release_after_policy_pull() -> None:
+    events: list[str] = []
+    controller = _controller(events)
+    controller.config.async_loop.num_training_steps = 1
+    queue = _batch_queue(
+        1,
+        group_ids=[0, 1, 2, 3, 4],
+        headroom_group_ids=[5, 6],
+    )
+    asyncio.run(controller._trainer_loop(queue, num_training_steps=1))
+
+    assert controller.committed_sample_ids == [[0, 1, 2, 3, 4, 5, 6]]
+    assert events[-2:] == ["release 5 trained", "release 2 headroom"]
 
 
 def test_optimizer_step_waits_for_the_previous_push() -> None:

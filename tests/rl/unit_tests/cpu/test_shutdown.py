@@ -108,12 +108,21 @@ def test_async_loop_config_derives_window_and_max_offpolicy_steps() -> None:
     )
     assert (wide.window_size, wide.max_offpolicy_steps) == (40, 6)
 
+    with_headroom = AsyncLoopConfig(
+        num_prompts_per_train_step=8,
+        target_offpolicy_steps=3,
+        num_rollout_group_headroom=2,
+    )
+    assert with_headroom.max_active_rollout_groups == 34
+
 
 def test_async_loop_config_rejects_bad_windowed_fifo_batches() -> None:
     with pytest.raises(ValueError, match="windowed_fifo_batches"):
         AsyncLoopConfig(windowed_fifo_batches=0)
     with pytest.raises(TypeError, match="window_fraction"):
         AsyncLoopConfig(window_fraction=0.3)  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="num_rollout_group_headroom"):
+        AsyncLoopConfig(num_rollout_group_headroom=-1)
 
 
 def _make_stub_rl_trainer(tmp_path):

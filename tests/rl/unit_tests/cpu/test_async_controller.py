@@ -630,6 +630,29 @@ def test_take_finalized_does_not_release_active_slot() -> None:
     asyncio.run(run())
 
 
+def test_retire_oldest_drops_late_results_without_releasing_slots() -> None:
+    async def run() -> None:
+        buffer = _buffer(capacity=4, window_size=None)
+        for group_id in range(4):
+            await _admit(buffer, group_id)
+        assert (await buffer.claim_next()).group_id == 0
+        assert (await buffer.claim_next()).group_id == 1
+        await _finalize(buffer, 1)
+        assert (await buffer.take_finalized()).group_id == 1
+
+        assert await buffer.retire_oldest(2) == [0, 2]
+        await _finalize(buffer, 0)
+        assert (await buffer.claim_next()).group_id == 3
+
+        waiter = asyncio.create_task(buffer.wait_for_slot())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        await buffer.release_active_groups(3, reason="trained_and_headroom")
+        assert await waiter
+
+    asyncio.run(run())
+
+
 def test_untrainable_group_releases_before_training() -> None:
     async def run() -> None:
         buffer = RolloutGroupWorkBuffer.Config().build(
