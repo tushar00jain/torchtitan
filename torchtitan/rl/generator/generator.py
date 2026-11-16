@@ -461,6 +461,11 @@ class Generator(Configurable):
             requester_index: Index used to namespace this generator mesh.
         """
         await ts.client(role=RankRole.REQUESTER, group=requester_index)
+        if self._prefetched_model_state_dict is not None:
+            await ts.prepare_state_dict(
+                "model_state_dict",
+                self._prefetched_model_state_dict,
+            )
         self._torchstore_loop = asyncio.get_running_loop()
 
     async def model_state_dict_layout(self) -> tuple[int, dict[str, TensorShard]]:
