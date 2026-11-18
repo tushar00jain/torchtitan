@@ -31,6 +31,33 @@ from torch.distributed.tensor._utils import compute_local_shape_and_global_offse
 from torch.distributed.tensor.placement_types import _StridedShard
 
 from torchtitan.config import Configurable
+from torchtitan.observability import structured_logger as sl
+
+
+def log_memory(role: str) -> None:
+    """[benchmark] Log this process's host RSS (current/peak) and GPU memory."""
+    import resource
+
+    scalars = {
+        f"mem/{role}/ru_maxrss_gib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        / 2**20
+    }
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                scalars[f"mem/{role}/rss_gib"] = int(line.split()[1]) / 2**20
+            elif line.startswith("VmHWM:"):
+                scalars[f"mem/{role}/peak_rss_gib"] = int(line.split()[1]) / 2**20
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        scalars[f"mem/{role}/gpu_used_gib"] = (total - free) / 2**30
+        scalars[f"mem/{role}/gpu_max_reserved_gib"] = (
+            torch.cuda.max_memory_reserved() / 2**30
+        )
+        scalars[f"mem/{role}/gpu_max_allocated_gib"] = (
+            torch.cuda.max_memory_allocated() / 2**30
+        )
+    sl.log_trace_scalar(scalars)
 
 # Byte alignment of each staged piece, so it can be viewed as any dtype.
 _ALIGNMENT = 16
@@ -521,6 +548,8 @@ class ModelStateDictTransport(Configurable):
         self._current = current
         self._transfer_ranges = transfer_ranges
         self._transfer_range_keys = transfer_range_keys
+        sl.log_trace_scalar({"model_state_dict_staging_buffer_bytes": storage.nbytes})
+        log_memory("trainer")
         return TrainerSource(
             pieces,
             baseline_buffer,
@@ -625,6 +654,11 @@ class ModelStateDictTransport(Configurable):
                 )
             )
         self._prefetched = prefetched_model_state_dict
+        sl.log_trace_scalar(
+            {"model_state_dict_prefetch_buffer_bytes": sum(
+                t.nbytes for t in prefetched_model_state_dict.values())}
+        )
+        log_memory("generator")
         self._packed = {
             key: [
                 (
@@ -665,6 +699,7 @@ class ModelStateDictTransport(Configurable):
         for source in sources:
             self._transport.connect(source.url)
         self._gpu_keys = frozenset(layout)
+        log_memory("generator")
         self._gpu_packed = packed
         self._gpu_layout = layout
         self._gpu_groups = [frozenset(group) for group in load_groups]
@@ -734,6 +769,19 @@ class ModelStateDictTransport(Configurable):
             self._finish_gpu_prefetch()
             slot = self._gpu_next_slot
             works = self._read_gpu_group(group, slot)
+        sl.log_trace_scalar(
+            {
+                "model_state_dict_read_bytes": sum(
+                    read.nbytes
+                    for key in self._gpu_groups[group]
+                    for read, _ in self._gpu_reads.get(key, ())
+                ),
+                "model_state_dict_total_bytes": sum(
+                    read.nbytes for reads in self._gpu_reads.values() for read, _ in reads
+                ),
+                "model_state_dict_read_keys": len(tensors),
+            }
+        )
         for work in works:
             work.wait()
         # Prefetch only within this load: the trainer may restage after it.
@@ -769,6 +817,7 @@ class ModelStateDictTransport(Configurable):
                     tensor[piece.index].copy_(view, non_blocking=True)
         if event is not None:
             event.record()
+        log_memory("generator")
         return state_dict.keys()
 
     def _allocate_gpu_staging(self, device: torch.device) -> None:
@@ -781,6 +830,9 @@ class ModelStateDictTransport(Configurable):
             self._gpu_staging.append(
                 (buffer, self._transport.register_memory(buffer), event)
             )
+        sl.log_trace_scalar(
+            {"model_state_dict_gpu_staging_buffer_bytes": 2 * buffer.nbytes}
+        )
 
     def _read_gpu_group(self, group: int, slot: int) -> list[Any]:
         """Start reading every key of load group ``group`` into staging buffer ``slot``."""
@@ -831,17 +883,26 @@ class ModelStateDictTransport(Configurable):
             return
 
         if full or self._sync_mode == "full":
-            reads = [(local, baseline) for _, local, baseline, _ in self._reads]
+            selected = [(read, local, baseline) for read, local, baseline, _ in self._reads]
         else:
             changed_ranges_by_source = [
                 set(metadata.changed_ranges) for metadata in metadata_by_trainer_rank
             ]
-            reads = [
-                (local, current)
+            selected = [
+                (read, local, current)
                 for read, local, _, current in self._reads
                 if TransferRange(read.byte_offset, read.nbytes)
                 in changed_ranges_by_source[read.source]
             ]
+        sl.log_trace_scalar(
+            {
+                "model_state_dict_read_bytes": sum(r.nbytes for r, _, _ in selected),
+                "model_state_dict_total_bytes": sum(r.nbytes for r, _, _, _ in self._reads),
+                "model_state_dict_read_count": len(selected),
+                "model_state_dict_read_full": int(full or self._sync_mode == "full"),
+            }
+        )
+        reads = [(local, remote) for _, local, remote in selected]
         if not reads:
             return
         works = await asyncio.to_thread(
@@ -851,6 +912,7 @@ class ModelStateDictTransport(Configurable):
             ]
         )
         await wait_all(works, timeout=self._read_timeout_s)
+        log_memory("generator")
 
     def copy_prefetched_(self, state_dict: dict[str, torch.Tensor]) -> Iterable[str]:
         """Copy ``state_dict`` in place from the prefetch buffers, unpacking packed
