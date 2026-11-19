@@ -478,6 +478,12 @@ class ModelStateDictLoader:
         self._fsdp_load_groups, self._buffer_keys = _fsdp_load_groups(
             model, frozen_param_keys=frozen_param_keys
         )
+        self.model_state_dict_load_groups: list[list[str]] = [
+            [key for key, _ in trainable_params]
+            for _, trainable_params, _ in self._fsdp_load_groups
+        ] + ([self._buffer_keys] if self._buffer_keys else [])
+        """The keys of each ``fetch`` call of a ``load`` that fills every key, in
+        load order."""
         self._gpu_fetch_has_quantized_params = (
             model_state_dict_load_mode == "gpu_fetch"
             and any(

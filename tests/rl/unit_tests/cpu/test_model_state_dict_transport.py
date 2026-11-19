@@ -458,7 +458,13 @@ def test_gpu_fetch_reads_selected_keys(monkeypatch, sync_mode):
     trainer.finish_stage()
 
     generator = ModelStateDictTransport(config)
-    generator.connect_generator_gpu(layout, sources=[source], rank=0, generator_index=0)
+    generator.connect_generator_gpu(
+        layout,
+        load_groups=[["unchanged"], ["changed"]],
+        sources=[source],
+        rank=0,
+        generator_index=0,
+    )
 
     target = {key: value.clone() for key, value in initial.items()}
     target["changed"][0] += 1
@@ -467,11 +473,15 @@ def test_gpu_fetch_reads_selected_keys(monkeypatch, sync_mode):
     expected_keys = initial.keys() if sync_mode == "full" else {"changed"}
     assert generator.changed_keys((metadata,), full=False) == expected_keys
 
-    destination = {key: torch.zeros_like(target[key]) for key in expected_keys}
-    assert generator.read_into(destination) == destination.keys()
-    for key in expected_keys:
+    for key in ("unchanged", "changed"):
+        if key not in expected_keys:
+            continue
+        destination = {key: torch.zeros_like(target[key])}
+        assert generator.read_into(destination) == destination.keys()
         torch.testing.assert_close(destination[key], target[key], rtol=0, atol=0)
-    assert len(generator._transport.unregistered) == len(expected_keys)
+    # The two staging buffers are registered once, never per load.
+    assert len(generator._transport.registered) == 2
+    assert generator._transport.unregistered == []
 
 
 def test_gpu_fetch_unpacks_staged_pieces(monkeypatch):
@@ -500,11 +510,71 @@ def test_gpu_fetch_unpacks_staged_pieces(monkeypatch):
         trainer.finish_stage()
 
     generator = ModelStateDictTransport(config)
-    generator.connect_generator_gpu(layout, sources=sources, rank=0, generator_index=0)
+    generator.connect_generator_gpu(
+        layout, load_groups=[["w"]], sources=sources, rank=0, generator_index=0
+    )
     assert set(generator._gpu_packed) == {"w"}
+    generator.changed_keys((), full=True)
     destination = {"w": torch.zeros_like(full)}
     generator.read_into(destination)
     torch.testing.assert_close(destination["w"], full, rtol=0, atol=0)
+
+
+def test_gpu_fetch_prefetches_next_group_of_the_load(monkeypatch):
+    config = ModelStateDictTransport.Config(
+        backend="nixl", sync_mode="delta", read_timeout_s=5.0
+    )
+    monkeypatch.setattr(m, "new_transport", lambda backend: _FakeTransport())
+    initial = {key: torch.full((4,), float(i)) for i, key in enumerate("abc")}
+    layout = m.shard_layout(initial)
+    trainer = ModelStateDictTransport(config)
+    source = trainer.register_trainer_source(
+        initial,
+        generator_rank_layouts=[layout],
+        transfer_dtype=None,
+        preserve_dtype_keys=frozenset(),
+    )
+    trainer.stage(initial)
+    trainer.finish_stage()
+    generator = ModelStateDictTransport(config)
+    generator.connect_generator_gpu(
+        layout,
+        load_groups=[["a"], ["b"], ["c"]],
+        sources=[source],
+        rank=0,
+        generator_index=0,
+    )
+    reads = generator._transport.reads
+    # Every key is 16 bytes, padded to one alignment unit.
+    assert generator._gpu_staging_nbytes == m._GPU_STAGING_ALIGNMENT
+
+    def load(keys, target):
+        for key in "abc":
+            if key in keys:
+                destination = {key: torch.zeros(4)}
+                generator.read_into(destination)
+                torch.testing.assert_close(destination[key], target[key])
+
+    # Full load: reading a prefetches b, reading b prefetches c, c prefetches none.
+    assert generator.changed_keys((), full=True) == set("abc")
+    generator.read_into({"a": torch.zeros(4)})
+    assert len(reads) == 2
+    generator.read_into({"b": torch.zeros(4)})
+    generator.read_into({"c": torch.zeros(4)})
+    assert len(reads) == 3
+
+    # Delta load of a and c: reading a prefetches c, skipping b, and the next
+    # load reads fresh values rather than a prefetch from this one.
+    target = {key: value + 10 for key, value in initial.items()}
+    target["b"] = initial["b"]
+    trainer.stage(target)
+    keys = generator.changed_keys((trainer.finish_stage(),), full=False)
+    assert keys == {"a", "c"}
+    load(keys, target)
+    assert len(reads) == 5
+    target = {key: value + 20 for key, value in initial.items()}
+    trainer.stage(target)
+    load(generator.changed_keys((trainer.finish_stage(),), full=False), target)
 
 
 def test_shared_rank_layouts():

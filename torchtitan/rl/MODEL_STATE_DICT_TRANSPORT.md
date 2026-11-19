@@ -87,8 +87,8 @@ does not cover every element of a generator shard, or on `Partial` and uneven
    (`shared_rank_layouts`); each trainer rank allocates and registers one staging
    tensor for full sync, or a baseline and a current-state staging tensor for
    delta sync (`register_trainer_source`); every CPU-prefetch generator rank
-   registers its persistent prefetch buffers. A GPU-fetch rank registers each
-   temporary FSDP-group destination during loading.
+   registers its persistent prefetch buffers. A GPU-fetch rank registers two GPU
+   staging buffers, each the size of its largest FSDP load group, on its first load.
 2. Push: full sync overwrites its staging tensor. For delta sync, the first push
    fills the baseline. Later pushes fill the current-state tensor, then compare its
    packed-piece ranges with the baseline after the device-to-host copies finish.
@@ -97,12 +97,12 @@ does not cover every element of a generator shard, or on `Partial` and uneven
    control-plane metadata.
 3. Pull: CPU prefetch reads every piece for full sync, or only changed pieces for
    delta sync. GPU fetch uses the changed ranges to skip unchanged FSDP groups and
-   reads each selected group directly into its GPU shards. Packed pieces use a
-   temporary contiguous GPU buffer and are unpacked before the existing FSDP
-   all-gather and quantization. Each generator rank raises after `read_timeout_s`
+   reads each selected group into a staging buffer while the previous group is
+   copied out of the other buffer into its GPU shards (unpacking packed pieces)
+   and goes through the existing FSDP all-gather and quantization. Each generator rank raises after `read_timeout_s`
    (600 s).
 4. Load: CPU prefetch copies weights from its persistent buffers. GPU fetch uses
-   the existing FSDP all-gather and quantization after each direct read.
+   the existing FSDP all-gather and quantization after each group's copy.
 
 The controller remains the only weight-sync coordinator and policy-version
 authority. It forwards the changed ranges without interpreting them and finishes

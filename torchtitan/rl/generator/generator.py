@@ -306,6 +306,7 @@ class Generator(Configurable):
 
         self._prefetched_model_state_dict = engine.prefetched_model_state_dict
         self._model_state_dict_layout = engine.model_state_dict_layout
+        self._model_state_dict_load_groups = engine.model_state_dict_load_groups
         # Set by `connect_model_state_dict_transport`; None reads from TorchStore.
         self._model_state_dict_transport: ModelStateDictTransport | None = None
         self._model_state_dict_transport_needs_full_read = True
@@ -494,6 +495,7 @@ class Generator(Configurable):
         else:
             self._model_state_dict_transport.connect_generator_gpu(
                 self._model_state_dict_layout,
+                load_groups=self._model_state_dict_load_groups,
                 sources=trainer_sources,
                 rank=self._rank,
                 generator_index=generator_index,

@@ -512,6 +512,10 @@ class SGLangEngine(GenerationEngine):
     def model_state_dict_layout(self) -> dict[str, TensorShard]:
         return self._get_model().model_state_dict_loader.model_state_dict_layout
 
+    @property
+    def model_state_dict_load_groups(self) -> list[list[str]]:
+        return self._get_model().model_state_dict_loader.model_state_dict_load_groups
+
     def add_requests(
         self, requests: list[EngineRequest]
     ) -> list[tuple[str, Exception]]:
