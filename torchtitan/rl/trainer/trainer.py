@@ -28,6 +28,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
 from torchtitan.rl.controller.metrics import combine_microbatch_metrics
+from torchtitan.rl.model_state_dict_transport import log_memory
 from torchtitan.rl.model_state_dict_transport import (
     ModelStateDictTransferMetadata,
     ModelStateDictTransport,
@@ -484,12 +485,16 @@ class Trainer(Configurable):
         transport = self._model_state_dict_transport
         if transport is not None:
             stream = self._push_model_state_dict_stream
-            with stream if stream is not None else nullcontext():
-                transport.stage(self._trainable_model_state_dict())
-            # Generators read the staging buffer outside stream order.
-            if stream is not None:
-                await asyncio.to_thread(stream.synchronize)
-            return await asyncio.to_thread(transport.finish_stage)
+            with sl.log_trace_span("stage_model_state_dict"):
+                with stream if stream is not None else nullcontext():
+                    transport.stage(self._trainable_model_state_dict())
+                # Generators read the staging buffer outside stream order.
+                if stream is not None:
+                    await asyncio.to_thread(stream.synchronize)
+            with sl.log_trace_span("finish_stage_model_state_dict"):
+                metadata = await asyncio.to_thread(transport.finish_stage)
+            log_memory("trainer")
+            return metadata
         model_state_dict = self._trainable_model_state_dict()
         await asyncio.to_thread(
             self._put_model_state_dict,
